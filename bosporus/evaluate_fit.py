@@ -11,3 +11,6 @@ def log_likelihood(C_true, C_pred):
 def akaike_information_criterion(num_params, log_likelihood_model):
     return 2 * num_params - 2 * log_likelihood_model
 
+
+def relative_likelihood(aic_model, aic_baseline, N):
+    return np.exp((aic_baseline - aic_model) / (2 * N))
