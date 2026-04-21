@@ -17,7 +17,8 @@ dependencies = ["scikit-learn",
                 "scipy",
                 "numpy",
                 "pandas"]
-
+[project.optional-dependencies]
+dev = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/bionetslab/bosporus-package"

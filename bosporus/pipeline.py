@@ -98,6 +98,7 @@ class BosporusFlow():
 
                 # Fit all models
                 for fit_class in fits:
+                    # Remove NaN values from both C and d
                     fit_instance = fit_class(C, d)
                     fit_instance.fit()
 
@@ -134,9 +135,13 @@ class BosporusFlow():
                     "measure": measure,
                     "best_fit_type": best_fit_name,
                     "entropy_AIC_weights": entropy,
-                    "effect_strength": best_fit.effect_strength,
-                    "relative_support": best_fit.relative_support,
+                    "observed_half_life": best_fit.observed_half_life,
+                    "observed_effect_strength": best_fit.observed_effect_strength,
+                    "included samples": best_fit.included_samples,
+                    "affected samples": best_fit.fraction_not_converged()
                 }
+                
+                row.update(best_fit.params)  # Add best fit parameters to the row
                 
                 # Add per-model metrics (order-independent)
                 for name in rel_ll:

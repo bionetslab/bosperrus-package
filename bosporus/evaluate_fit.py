@@ -4,7 +4,7 @@ import pandas as pd
 def log_likelihood(C_true, C_pred):
     n = len(C_true)
     residuals = C_true - C_pred
-    sigma2 = np.mean(residuals**2)  # MSE as variance estimate, THIS IS ANOTHER PARAMETER THAT NEEDS TO BE ACCOUNTED FOR IN AIC CALCULATION
+    sigma2 = np.mean(residuals**2)
     return -0.5 * n * (np.log(2 * np.pi * sigma2) + 1)
 
 
