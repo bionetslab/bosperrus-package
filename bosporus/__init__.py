@@ -1,3 +1,7 @@
 from .fit import *
-from .graph_construction import *
-from .pipeline import *
+
+try:
+    from .pipeline import *
+    from .centrality_measures import *
+except ImportError:
+    pass
