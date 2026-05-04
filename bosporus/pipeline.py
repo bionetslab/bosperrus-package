@@ -5,14 +5,14 @@ import pandas as pd
 from .fit import ConstantFit, MichaelisMentenFit, PiecewiseLinearFit, ExponentialSaturationFit
 from .centrality_measures import compute_centrality_measures
 
-class BosporusFlow():
+class Flow():
     def __init__(self, coordinates: np.ndarray = None):
         self.coordinates = coordinates
         if coordinates is not None:
-            self.df = pd.DataFrame(index=range(len(coordinates)))
+            self.observations = pd.DataFrame(index=range(len(coordinates)))
         else:
-            self.df = pd.DataFrame()
-        self.best_fits = None
+            self.observations = pd.DataFrame()
+            
         self.fit_quality = None
         self.best_fits = dict()
                 
@@ -22,7 +22,9 @@ class BosporusFlow():
             self.N = None
     
 
-    def run_all(self, graph_type, params, distance_function, distance_key=None, measures=["degree", "closeness", "betweenness", "harmonic", "clustering", "pagerank"], fits=[ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit], calculate_rel_ll_to_baseline=ConstantFit):
+    def flow(self, graph_type, params, distance_function, distance_key=None, measures=None, fits=None, calculate_rel_ll_to_baseline=None):
+        if measures is None:
+            measures = ["degree", "betweenness", "closeness", "clustering", "pagerank"]
         self.construct_graph(graph_type, params)
         self.compute_centralities(measures=measures)
         distance_key = distance_function(distance_key=distance_key)
@@ -31,7 +33,7 @@ class BosporusFlow():
     
     def set_edge_list(self, edge_list):
         self.edge_list = edge_list
-        self.N = len(self.df)
+        self.N = len(self.observations)
     
     def construct_graph(self, graph_type, params=None):
         if graph_type == "delaunay":
@@ -54,43 +56,43 @@ class BosporusFlow():
     
     def compute_centralities(self, measures):
         centralities = pd.DataFrame(compute_centrality_measures(self.edge_list, N=self.N, measures=measures))
-        self.df = pd.concat([self.df, centralities], axis=1)
+        self.observations = pd.concat([self.observations, centralities], axis=1)
         return
     
     def set_custom_centralities(self, centralities: pd.DataFrame):
-        self.df = pd.concat([self.df, centralities], axis=1)
+        self.observations = pd.concat([self.observations, centralities], axis=1)
         return
     
     def compute_distance_to_convex_hull(self, distance_key=None):
         distance = distance_to_convex_hull(self.coordinates)
         if distance_key is not None:
             distance.name = distance_key
-        self.df = pd.concat([self.df, distance], axis=1)
+        self.observations = pd.concat([self.observations, distance], axis=1)
         return distance.name
     
     def compute_distance_to_pointset(self, pointset, distance_key=None):
         distance = distance_to_pointset(self.coordinates, pointset)
         if distance_key is not None:
             distance.name = distance_key
-        self.df = pd.concat([self.df, distance], axis=1)
+        self.observations = pd.concat([self.observations, distance], axis=1)
         return distance.name
     
     def compute_distance_to_mask(self, mask, distance_key=None):
         distance = distance_to_mask(self.coordinates, mask)
         if distance_key is not None:
             distance.name = distance_key
-        self.df = pd.concat([self.df, distance], axis=1)
+        self.observations = pd.concat([self.observations, distance], axis=1)
         return distance.name
     
     def set_custom_distances(self, distance_series: pd.Series):
-        self.df = pd.concat([self.df, distance_series], axis=1)
+        self.observations = pd.concat([self.observations, distance_series], axis=1)
         return distance_series.name
     
     def compute_distance_to_rectangular_border(self, distance_key=None):
         distance = distance_to_rectangular_border(self.coordinates)
         if distance_key is not None:
             distance.name = distance_key
-        self.df = pd.concat([self.df, distance], axis=1)
+        self.observations = pd.concat([self.observations, distance], axis=1)
         return distance.name
     
         
@@ -98,17 +100,24 @@ class BosporusFlow():
         self,
         measures,
         distance_key,
-        fits=[ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit],
-        calculate_rel_ll_to_baseline=ConstantFit
+        fits=None, 
+        calculate_rel_ll_to_baseline=None
     ):
+        
+        if fits is None:
+            fits = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]
+        if calculate_rel_ll_to_baseline is None:
+            calculate_rel_ll_to_baseline = ConstantFit
+        if calculate_rel_ll_to_baseline not in fits:
+            raise ValueError("baseline fit class must be included in fits")
+            
         self.best_fits = dict()
         fit_quality_data = []
 
-        d = self.df[distance_key].values
+        d = self.observations[distance_key].values
 
         for measure in measures:
-            #try:
-            C = self.df[measure].values
+            S = self.observations[measure].values
             measure_fits = []
             aic_dict = {}
 
@@ -117,8 +126,7 @@ class BosporusFlow():
 
             # Fit all models
             for fit_class in fits:
-                # Remove NaN values from both C and d
-                fit_instance = fit_class(C, d)
+                fit_instance = fit_class(S, d)
                 fit_instance.fit()
 
                 name = fit_instance.name
@@ -147,8 +155,8 @@ class BosporusFlow():
 
             # Entropy over competing (non-baseline) models
             entropy = -(weights * np.log(weights + 1e-15)).sum()
+            entropy = entropy / np.log(len(weights))  # Normalize to [0,1]
 
-            # Build result row
             row = {
                 "measure": measure,
                 "best_fit_type": best_fit_name,
@@ -156,18 +164,15 @@ class BosporusFlow():
                 "observed_half_life": best_fit.observed_half_life,
                 "observed_effect_strength": best_fit.observed_effect_strength,
                 "included samples": best_fit.included_samples,
-                "affected samples": best_fit.fraction_not_converged
+                "affected samples": best_fit.fraction_not_converged,
+                f"scaled_relative_likelihood_over_{baseline_name}": rel_ll[best_fit_name] if best_fit_name in rel_ll else 1.0,  # If best fit is baseline, set to 1.0
+                "AIC_weight": weight_dict[best_fit_name] if best_fit_name in weight_dict else np.nan  # If best fit is baseline, set to nan
             }
             
             row.update(best_fit.params)  # Add best fit parameters to the row
-            self.best_fits[measure] = best_fit
-            
-            # Add per-model metrics (order-independent)
-            for name in rel_ll:
-                row[f"{name}_scaled_relative_likelihood_over_{baseline_name}"] = rel_ll[name]
-                row[f"{name}_AIC_weight"] = weight_dict[name]
-
             fit_quality_data.append(row)
-            self.df[f"BOSPORUS corrected {measure}"] = best_fit.correct()
+            
+            self.best_fits[measure] = best_fit
+            self.observations[f"BOSPORUS corrected {measure}"] = best_fit.S_corrected
 
         self.fit_quality = pd.DataFrame(fit_quality_data)
