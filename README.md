@@ -44,11 +44,11 @@ conda install graph-tool -c conda-forge
 Entry points / input types:
 ![Entry points](https://github.com/bionetslab/bosporus-package/blob/master/plots_readme/bosporus_flow.svg?raw=true)
 
-Like its namesake, the Flow class in the Bosporus package enables multiple entry points and flexible branching:
-Purple: Given coordinates, a distance function, a graph operator (Delaunay, k-nearest neighbor, or radius nearest neighbor, and functions for node observations (degree, closeness, clustering coefficients, …).   
-Pink: Given coordinates, a distance function, an edge list, and functions for node observations (degree, closeness, clustering coefficients, …).   
-Yellow: Given coordinates, a distance function, and observations.   
-Green: Given distances and observations.   
+Like its namesake, the Flow class in the Bosporus package enables multiple entry points and flexible branching:   
+🟣 Given coordinates, a distance function, a graph operator (Delaunay, k-nearest neighbor, or radius nearest neighbor, and functions for node observations (degree, closeness, clustering coefficients, …).   
+🩷 Given coordinates, a distance function, an edge list, and functions for node observations (degree, closeness, clustering coefficients, …).   
+🟡 Given coordinates, a distance function, and observations.   
+☘️ Given distances and observations.   
 
 
 Distance functions:   
