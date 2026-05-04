@@ -1,5 +1,10 @@
 import numpy as np
-from graph_tool.all import Graph
+try:
+    from graph_tool.all import Graph
+    HAS_GRAPH_TOOL = True
+except ImportError:
+    HAS_GRAPH_TOOL = False
+    
 from graph_tool.centrality import betweenness, pagerank, closeness
 from graph_tool.clustering import local_clustering
 
