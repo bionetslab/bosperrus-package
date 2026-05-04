@@ -1,0 +1,51 @@
+name: Python application
+
+on:
+  push:
+    paths:
+      - 'scxmatch/**'
+      - 'tests/**'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}  # required for conda activation to persist across steps
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Miniconda
+      uses: conda-incubator/setup-miniconda@v3
+      with:
+        miniconda-version: 'latest'
+        python-version: "3.10"
+        channels: conda-forge
+        channel-priority: strict
+        auto-activate-base: true
+
+    - name: Install graph-tool and dependencies via conda
+      run: |
+        conda install -y graph-tool
+
+    - name: Install package and test dependencies
+      run: |
+        pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        pip install -e .
+
+    - name: Lint with flake8
+      run: |
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Test with pytest
+      run: |
+        pytest
