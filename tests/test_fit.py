@@ -1,6 +1,5 @@
 """
 Unit tests for fit.py
-
 Coverage:
 - Basic API (fit runs, attributes set, correct() works)
 - Score / AIC sanity (better fit → lower AIC)
