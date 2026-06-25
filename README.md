@@ -1,4 +1,4 @@
-# BOSPORUS: BOundary effects in SPatial graphs: ERRor modeling and Untangling Strategies
+# BOSPERRUS: BOundary effects in SPatial graphs: ERRor modeling and Untangling Strategies
 
 ## Tutorial — Getting Started with `BosporusFlow`
 
