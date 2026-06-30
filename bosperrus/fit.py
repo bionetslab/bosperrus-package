@@ -43,6 +43,10 @@ class Fit():
         mask = np.isfinite(S_true) & np.isfinite(d)
         self._S_true = S_true[mask].copy()
         self._d = d[mask].copy()
+        
+        if len(S_true[mask]) == 0:
+            raise ValueError("No valid data points to fit after filtering non-finite values.")
+        
         self._mask = mask.copy()  # store the mask, not really meant to be visible from outside
         self._included_samples = np.sum(mask) / len(mask)
         
@@ -58,7 +62,7 @@ class Fit():
         self._converged = False # not really meaningful to outside
         self._name = None
         
-        # These are only modified when fits are compared against each other from the Bosporus Flow class
+        # These are only modified when fits are compared against each other from the Flow class
         self.entropy_AIC_weights = None
         self.scaled_relative_loglikelihood_over_baseline = None
 
@@ -83,7 +87,6 @@ class Fit():
             "included samples": self.included_samples,
             "affected samples": self.fraction_not_converged,
             "scaled_relative_likelihood_over_baseline": self.scaled_relative_loglikelihood_over_baseline,
-            "AIC_weight": self.AIC_weight
         }
         summary.update(self.params)
         return summary

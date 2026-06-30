@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bosporus.fit import (
+from bosperrus.fit import (
     ConstantFit,
     PiecewiseLinearFit,
     ExponentialSaturationFit,

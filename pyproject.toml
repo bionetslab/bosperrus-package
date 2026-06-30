@@ -1,5 +1,5 @@
 [project]
-name = "bosporus"
+name = "bosperrus"
 version = "0.0.0"
 authors = [
   { name="Anna Moeller", email="anna.moeller@fau.de" },
@@ -23,8 +23,8 @@ dev = ["pytest"]
 graph = ["graph-tool"] # this will fail, only to document intent
 
 [project.urls]
-Homepage = "https://github.com/bionetslab/bosporus-package"
-Issues = "https://github.com/bionetslab/bosporus-package/issues"
+Homepage = "https://github.com/bionetslab/bosperrus-package"
+Issues = "https://github.com/bionetslab/bosperrus-package/issues"
 
 [build-system]
 build-backend = "hatchling.build"
@@ -32,5 +32,5 @@ requires = ["hatchling"]
 
 [tool.uv.workspace]
 members = [
-    "bosporus-package",
+    "bosperrus-package",
 ]
