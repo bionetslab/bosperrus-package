@@ -5,6 +5,8 @@ from .evaluate_fit import log_likelihood, akaike_information_criterion
 
 _EPS = 1e-10
 
+__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'MichaelisMentenFit']
+
 class Fit():
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
@@ -232,6 +234,9 @@ class ConstantFit(Fit):
         d : pd.DataFrame | pd.Series, optional
             Not used for fitting but accepted for API consistency with other subclasses.
         """
+        if d is None:
+            idx = S_true.index if hasattr(S_true, 'index') else range(len(S_true))
+            d = pd.Series(np.zeros(len(S_true)), index=idx)
         super().__init__(S_true, d)
         self._name = "Constant Fit"
 
@@ -366,7 +371,8 @@ class PiecewiseLinearFit(Fit):
         if self.params is None:
             raise ValueError("Model has not been fitted yet")
         if not self._converged:
-            return np.nan
+            self._fraction_not_converged = np.nan
+            return
         b = self.params["piecewise_linear_b"]
         self._fraction_not_converged = float(np.mean(self._d <= b))
 
@@ -376,15 +382,19 @@ class PiecewiseLinearFit(Fit):
             self._params = {"piecewise_linear_b": b_opt, "piecewise_linear_m": m_opt, "piecewise_linear_c": c_opt}
             self._S_model = C_fit
             self._converged = True
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             self._params = {"piecewise_linear_b": np.nan, "piecewise_linear_m": np.nan, "piecewise_linear_c": np.nan}
             self._S_model = self._S_true
             self._converged = False
-        
+
         if self._converged:
             self._rate_observed_metrics()
             self._calculate_fraction_not_converged()
             self._score()
+        else:
+            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
+            self._rate_observed_metrics()
+            self._fraction_not_converged = np.nan
 
     def correct(self):
         if self._params is None:
@@ -473,15 +483,19 @@ class ExponentialSaturationFit(Fit):
             self._params = {"exponential_saturation_a": a_opt, "exponential_saturation_b": b_opt, "exponential_saturation_c": c_opt}
             self._S_model = C_fit
             self._converged = True
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             self._converged = False
             self._params = {"exponential_saturation_a": np.nan, "exponential_saturation_b": np.nan, "exponential_saturation_c": np.nan}
             self._S_model = self._S_true
-        
+
         if self._converged:
             self._rate_observed_metrics()
             self._calculate_fraction_not_converged()
             self._score()
+        else:
+            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
+            self._rate_observed_metrics()
+            self._fraction_not_converged = np.nan
 
     def correct(self):
         if self._params is None:
@@ -560,7 +574,8 @@ class MichaelisMentenFit(Fit):
         if self.params is None:
             raise ValueError("Model has not been fitted yet")
         if not self._converged:
-            return np.nan
+            self._fraction_not_converged = np.nan
+            return
         if not (0 < threshold < 1):
             raise ValueError("threshold must be in (0, 1)")
         b = self.params["michaelis_menten_b"]
@@ -573,15 +588,19 @@ class MichaelisMentenFit(Fit):
             self._params = {"michaelis_menten_a": a_opt, "michaelis_menten_b": b_opt, "michaelis_menten_c": c_opt}
             self._S_model = C_fit
             self._converged = True
-        except RuntimeError:
+        except (RuntimeError, ValueError):
             self._params = {"michaelis_menten_a": np.nan, "michaelis_menten_b": np.nan, "michaelis_menten_c": np.nan}
             self._S_model = self._S_true
             self._converged = False
-        
+
         if self._converged:
             self._rate_observed_metrics()
             self._calculate_fraction_not_converged()
             self._score()
+        else:
+            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
+            self._rate_observed_metrics()
+            self._fraction_not_converged = np.nan
 
 
     def correct(self):

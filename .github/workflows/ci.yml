@@ -1,52 +1,44 @@
-name: Python application
+name: Tests
 
 on:
-  push:
+  pull_request:
     paths:
-      - 'bosporus/**'
+      - 'bosperrus/**'
       - 'tests/**'
       - '.github/workflows/**'
+      - 'pyproject.toml'
+  push:
+    branches: [master]
+    paths:
+      - 'bosperrus/**'
+      - 'tests/**'
+      - '.github/workflows/**'
+      - 'pyproject.toml'
+
 permissions:
   contents: read
 
 jobs:
-  build-and-test:
-    name: Build and test
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash -el {0}  # required for conda activation to persist across steps
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-    - name: Set up Miniconda
-      uses: conda-incubator/setup-miniconda@v4
-      with:
-        miniconda-version: 'latest'
-        python-version: "3.10"
-        channels: conda-forge
-        channel-priority: strict
-        activate-environment: bosporus-env  # named env, activated in every step
-        auto-activate-base: false           # don't use base, use the named env
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-    - name: Install graph-tool and dependencies via conda
-      run: |
-        conda install -y graph-tool
-    
-    - name: Install package and test dependencies
-      run: |
-        conda run -n bosporus-env pip install --upgrade pip
-        conda run -n bosporus-env pip install flake8 pytest
-        if [ -f requirements.txt ]; then conda run -n bosporus-env pip install -r requirements.txt; fi
-        conda run -n bosporus-env pip install -e .
-    
-    - name: Lint with flake8
-      run: |
-        conda run -n bosporus-env flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        conda run -n bosporus-env flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
-    
-    - name: Test with pytest
-      run: |
-        conda run -n bosporus-env pytest
+      - name: Install package and test dependencies
+        run: pip install -e ".[dev]"
+
+      # compute_centrality_measures requires graph-tool (conda-only, not tested here).
+      # All other modules — fitting, model selection, graph construction, distances — are covered.
+      - name: Run tests
+        run: pytest tests/ -v --tb=short

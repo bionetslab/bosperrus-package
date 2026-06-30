@@ -511,3 +511,163 @@ class TestCrossModel:
             r = repr(f)
             assert cls.__name__ in r
             assert "not fitted" in r
+
+
+# ============================================================
+# Regression tests — bugs that were fixed
+# ============================================================
+
+class TestRegressions:
+    """Regression tests for bugs that were fixed (B3, B4)."""
+
+    rng = np.random.default_rng(42)
+
+    def test_constant_fit_d_none_does_not_crash(self):
+        """B4 — ConstantFit(d=None) must not raise TypeError."""
+        # Should construct without raising
+        f = ConstantFit(pd.Series([1.0, 2.0, 3.0]), None)
+        assert f is not None
+
+    def test_constant_fit_d_none_fit_runs(self):
+        """B4 — After construction with d=None, fit() and correct() must succeed."""
+        f = ConstantFit(pd.Series([1.0, 2.0, 3.0]), None)
+        f.fit()
+        result = f.correct()
+        assert result is not None
+        assert len(result) == 3
+
+    def _normal_data(self):
+        """Return a simple valid dataset."""
+        d = pd.Series(np.linspace(0, 10, 50))
+        S = pd.Series(np.ones(50) * 3.0)
+        return S, d
+
+    def test_piecewise_linear_fraction_not_converged_is_nan_not_none_when_not_converged(self, monkeypatch):
+        """B3 — fraction_not_converged must be np.nan (not None) after a failed fit.
+
+        Forces curve_fit failure via monkeypatching the internal fit method so
+        that the RuntimeError/ValueError branch in fit() is exercised.
+        """
+        S, d = self._normal_data()
+        f = PiecewiseLinearFit(S, d)
+        monkeypatch.setattr(f, "_fit_piece_wise_linear", lambda **kw: (_ for _ in ()).throw(RuntimeError("forced failure")))
+        f.fit()
+        # After a failed fit, _converged is False; B3 was that _fraction_not_converged
+        # stayed None instead of being set to np.nan.
+        assert f.fraction_not_converged is not None, (
+            "fraction_not_converged should be np.nan after a failed fit, not None"
+        )
+        assert np.isnan(f.fraction_not_converged), (
+            f"fraction_not_converged should be np.nan, got {f.fraction_not_converged!r}"
+        )
+
+    def test_michaelis_menten_fraction_not_converged_is_nan_not_none_when_not_converged(self, monkeypatch):
+        """B3 — same regression check for MichaelisMentenFit."""
+        S, d = self._normal_data()
+        f = MichaelisMentenFit(S, d)
+        monkeypatch.setattr(f, "_fit_michaelis_menten", lambda: (_ for _ in ()).throw(RuntimeError("forced failure")))
+        f.fit()
+        assert f.fraction_not_converged is not None, (
+            "fraction_not_converged should be np.nan after a failed fit, not None"
+        )
+        assert np.isnan(f.fraction_not_converged), (
+            f"fraction_not_converged should be np.nan, got {f.fraction_not_converged!r}"
+        )
+
+
+# ============================================================
+# PiecewiseLinearFit branch coverage
+# ============================================================
+
+class TestPiecewiseLinearFitBranches:
+    """Branch coverage for PiecewiseLinearFit.fit() refinement path."""
+
+    rng = np.random.default_rng(42)
+
+    def _good_data(self):
+        d = make_series(np.linspace(0, 10, 200))
+        C = make_series(PiecewiseLinearFit.piecewise_plateau(d.values, b=5.0, m=2.0, c=1.0))
+        return C, d
+
+    def test_fit_without_refinement(self):
+        """refine_fit=False must still set _params and _converged."""
+        C, d = self._good_data()
+        f = PiecewiseLinearFit(C, d)
+        f.fit(refine_fit=False)
+        assert f._params is not None
+        assert f._converged is True
+
+    def test_fit_refine_true_default(self):
+        """Default fit() (refine_fit=True) must produce valid params."""
+        C, d = self._good_data()
+        f = PiecewiseLinearFit(C, d)
+        f.fit()
+        assert f._params is not None
+        assert f._converged is True
+        assert np.isfinite(f.params["piecewise_linear_b"])
+
+    def test_correct_before_fit_raises(self):
+        """calling correct() before fit() must raise RuntimeError."""
+        C, d = self._good_data()
+        f = PiecewiseLinearFit(C, d)
+        with pytest.raises(RuntimeError):
+            f.correct()
+
+
+# ============================================================
+# fit_correct() passthrough and robustness
+# ============================================================
+
+class TestFitCorrectPassthrough:
+    """Test that fit_correct() survives hard data without crashing."""
+
+    rng = np.random.default_rng(42)
+
+    def _degenerate_d(self):
+        """Single unique d value causes curve_fit to fail for non-constant models."""
+        d = pd.Series(np.ones(30) * 5.0)
+        S = pd.Series(np.ones(30) * 2.0)
+        return S, d
+
+    def test_all_models_survive_fit_correct_on_hard_data(self):
+        """fit_correct() on degenerate data must not crash and return correct-length array.
+
+        When fitting fails, the passthrough (S_corrected = S_true) must be returned.
+        ConstantFit uses a synthetic d so it never fails.
+        """
+        S, d = self._degenerate_d()
+
+        # ConstantFit always succeeds; pass d explicitly for a consistent length check
+        f_const = ConstantFit(S, d)
+        result_const = f_const.fit_correct()
+        assert result_const is not None
+        assert len(result_const) == len(S)
+
+        for cls in [PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+            f = cls(S, d)
+            result = f.fit_correct()
+            # If not converged, S_corrected is None (fit_correct returns None when
+            # not converged); alternatively the passthrough may return an array.
+            # Either way, the call must not raise an exception.
+            # When converged: len must match. When not converged: result may be None.
+            if result is not None:
+                assert len(result) == len(S), (
+                    f"{cls.__name__}.fit_correct() returned wrong-length result"
+                )
+
+    def test_correct_passthrough_when_not_converged(self):
+        """When _converged=False, correct() must return S_true unchanged."""
+        C, d = make_series(np.linspace(1.0, 5.0, 50)), make_series(np.linspace(0, 10, 50))
+        f = PiecewiseLinearFit(C, d)
+        f.fit()
+        # Force non-convergence and call correct() again
+        f._converged = False
+        f._params = {"piecewise_linear_b": np.nan, "piecewise_linear_m": np.nan, "piecewise_linear_c": np.nan}
+        f._S_model = f._S_true.values.copy() if hasattr(f._S_true, 'values') else f._S_true.copy()
+        result = f.correct()
+        # Passthrough: corrected values should equal S_true (for non-NaN entries)
+        original_vals = f._S_true.values
+        result_vals = result.dropna().values
+        np.testing.assert_allclose(result_vals, original_vals, err_msg=(
+            "correct() passthrough should return S_true unchanged when not converged"
+        ))

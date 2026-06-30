@@ -5,13 +5,14 @@ from .evaluate_fit import relative_likelihood, calculate_AIC_weight_entropy
 from .graph_construction import construct_graph
 from .centrality_measures import compute_centrality_measures
 
+__all__ = ['Flow']
+
 class Flow():
     def __init__(self, scores: pd.DataFrame, distances: pd.Series):
         self._distance_key = distances.name
         self._measures = list(scores.columns)
-        self.observations = scores
+        self.observations = scores.copy()
         self.observations[self._distance_key] = distances
-        self.best_fit = dict()
 
     @classmethod
     def from_coords(cls, coordinates, distance_fn, measures, graph_type, distance_kwargs=None, graph_kwargs=None):
@@ -62,21 +63,22 @@ class Flow():
         self,
         measures=None,
         fits=None, 
-        calculate_rel_ll_to_baseline=None
+        baseline_fit_class=None
     ):
         
         if fits is None:
             fits = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]
-        if calculate_rel_ll_to_baseline is None:
-            calculate_rel_ll_to_baseline = ConstantFit
-        if calculate_rel_ll_to_baseline not in fits:
+        if baseline_fit_class is None:
+            baseline_fit_class = ConstantFit
+        if baseline_fit_class not in fits:
             raise ValueError("baseline fit class must be included in fits")
         
         if measures is None:
             measures = self._measures
         
         for m in measures:
-            assert m in self._measures, f"Measure '{m}' not found in scores. Available measures: {self._measures}"
+            if m not in self._measures:
+                raise ValueError(f"Measure '{m}' not found in scores. Available measures: {self._measures}")
         
         self.best_fits = dict()
         fit_quality_data = dict()
@@ -86,13 +88,13 @@ class Flow():
         for measure in measures:
             S = self.observations[measure].values
             
-            baseline_fit = calculate_rel_ll_to_baseline(S, d)
+            baseline_fit = baseline_fit_class(S, d)
             baseline_fit.fit()
             baseline_aic = baseline_fit.AIC
             
             fit_instances = []
             for fit_class in fits:
-                if fit_class == calculate_rel_ll_to_baseline:
+                if fit_class == baseline_fit_class:
                     continue
                 fit_instance = fit_class(S, d)
                 fit_instance.fit_correct()
@@ -101,6 +103,7 @@ class Flow():
             
             fit_instances.append(baseline_fit)
             best_fit = min(fit_instances, key=lambda x: x.AIC)
+            self.best_fits[measure] = best_fit
             self._set_entropy_weights(fit_instances, baseline_fit)
             
             fit_quality_data[measure] = best_fit.params_summary()

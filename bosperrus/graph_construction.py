@@ -2,6 +2,8 @@ from itertools import combinations
 from scipy.spatial import Delaunay
 from sklearn.neighbors import NearestNeighbors
 
+__all__ = ['construct_graph', 'knn_edges', 'rnn_edges', 'delaunay_edges']
+
 
 def construct_graph(coordinates, graph_type, k=None, r=None):
     if graph_type == "delaunay":

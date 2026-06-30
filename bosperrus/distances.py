@@ -3,6 +3,8 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree, ConvexHull, distance
 
+__all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_to_mask', 'distance_to_convex_hull']
+
 
 def distance_to_rectangular_border(coords):
     if coords.shape[1] != 2:
