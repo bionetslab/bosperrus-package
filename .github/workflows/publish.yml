@@ -1,0 +1,42 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (gate)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: pytest tests/ -v --tb=short
+
+  publish:
+    name: Build and publish
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build distributions
+        run: |
+          pip install build
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
