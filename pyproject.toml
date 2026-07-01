@@ -16,7 +16,8 @@ license-files = ["LICEN[CS]E*"]
 dependencies = ["scikit-learn",
                 "scipy",
                 "numpy",
-                "pandas"]
+                "pandas",
+                "networkx"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
