@@ -160,7 +160,23 @@ def distance_to_alpha_shape(coords, alpha):
     The alpha shape generalises the convex hull: larger ``alpha`` values
     produce more concave (tighter) boundaries that follow nooks and crannies
     in the data; ``alpha=0`` recovers the convex hull. Too large an ``alpha``
-    may produce an empty geometry — inspect the result visually before use.
+    may split the shape into disconnected pieces or produce an empty geometry.
+
+    .. warning::
+        ``alpha`` must be chosen carefully and validated visually before use.
+        The right value is data- and scale-dependent. Recommended workflow::
+
+            import alphashape, geopandas as gpd, matplotlib.pyplot as plt
+            shape = alphashape.alphashape(coords, alpha=YOUR_ALPHA)
+            gpd.GeoSeries([shape]).boundary.plot()
+            plt.scatter(coords[:, 0], coords[:, 1], s=1)
+            plt.show()
+
+        Increase ``alpha`` until the boundary traces the ROI nooks without
+        punching holes through the interior or splitting into fragments.
+        A :class:`UserWarning` is raised automatically if the shape becomes
+        disconnected (``MultiPolygon``), which is a reliable sign that
+        ``alpha`` is too large.
 
     Only 2-D coordinates are supported.
 
@@ -170,6 +186,8 @@ def distance_to_alpha_shape(coords, alpha):
         2-D node coordinates.
     alpha : float
         Concaveness parameter. ``alpha=0`` gives the convex hull limit.
+        Larger values follow concavities more tightly; too large produces
+        holes, disconnected fragments, or an empty shape.
 
     Returns
     -------
@@ -182,18 +200,27 @@ def distance_to_alpha_shape(coords, alpha):
     ------
     ImportError
         If ``alphashape`` is not installed.
+        Install with ``pip install alphashape`` or ``pip install bosperrus[alphashape]``.
     ValueError
         If ``coords`` is not Nx2, has fewer than 3 rows, or the resulting
         alpha shape is empty (try a smaller ``alpha``).
+
+    Warns
+    -----
+    UserWarning
+        If the alpha shape is a ``MultiPolygon`` (disconnected fragments),
+        indicating ``alpha`` is likely too large.
     """
     try:
         import alphashape
     except ImportError:
         raise ImportError(
             "alphashape is required for distance_to_alpha_shape. "
-            "Install it with: pip install alphashape"
+            "Install it with: pip install alphashape or pip install bosperrus[alphashape]"
         )
+    import warnings
     import shapely
+    from shapely.geometry import MultiPolygon
 
     coords = np.asarray(coords, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 2:
@@ -210,6 +237,18 @@ def distance_to_alpha_shape(coords, alpha):
     if shape is None or shape.is_empty:
         raise ValueError(
             f"Alpha shape is empty for alpha={alpha}. Try a smaller alpha value."
+        )
+
+    if isinstance(shape, MultiPolygon):
+        warnings.warn(
+            f"Alpha shape with alpha={alpha} produced a MultiPolygon "
+            f"({len(list(shape.geoms))} disconnected fragments). "
+            "This usually means alpha is too large: the boundary has been split "
+            "into pieces, and distances will be measured to the nearest fragment "
+            "rather than a single enclosing boundary. Consider reducing alpha "
+            "and inspecting the result visually.",
+            UserWarning,
+            stacklevel=2,
         )
 
     boundary = shape.boundary

@@ -244,6 +244,20 @@ def test_distance_to_alpha_shape_requires_at_least_3_points():
         distance_to_alpha_shape(coords, alpha=0)
 
 
+def test_distance_to_alpha_shape_multipolygon_warns():
+    """Alpha that splits the shape into fragments should raise a UserWarning."""
+    # Two well-separated clusters: a large enough alpha will produce one hull,
+    # but an intermediate alpha that keeps only within-cluster edges produces
+    # two disconnected polygons.
+    cluster_a = np.random.default_rng(0).uniform(0, 1, (30, 2))
+    cluster_b = np.random.default_rng(1).uniform(10, 11, (30, 2))
+    coords = np.vstack([cluster_a, cluster_b])
+    # alpha small enough to keep intra-cluster triangles but too small to
+    # bridge the gap between clusters → MultiPolygon
+    with pytest.warns(UserWarning, match="MultiPolygon"):
+        distance_to_alpha_shape(coords, alpha=2.0)
+
+
 def test_distance_to_alpha_shape_empty_raises():
     """Alpha large enough to exclude all Delaunay triangles → empty shape."""
     # Five points spread over a 1000x1000 grid produce large circumradii;
