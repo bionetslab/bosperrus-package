@@ -179,10 +179,10 @@ class TestPiecewiseLinearFit:
         f = self._fit(C, d)
         assert f.observed_effect_strength > 0
 
-    def test_half_life_within_data_range(self):
+    def test_half_life_normalized(self):
         C, d = self._ground_truth(noise=0.05)
         f = self._fit(C, d)
-        assert d.min() <= f.observed_half_life <= d.max()
+        assert 0 <= f.observed_half_life <= 1
 
     def test_fraction_not_converged_all_left_of_knot(self):
         # If all points are left of b, fraction should be 1.0
@@ -408,14 +408,12 @@ class TestMichaelisMentenFit:
         f = self._fit(C, d)
         assert f.observed_effect_strength < 0
 
-    def test_half_life_close_to_b(self):
-        # observed_half_life is the d where midpoint of [c_border, c_center] is reached.
-        # With d_min~0, this is close to the true Km (b).
+    def test_half_life_close_to_b_normalized(self):
+        # observed_half_life is normalized by d_max; with d_min~0 it should be close to b/d_max.
         a, b, c = 5.0, 2.0, 0.0
         C, d = self._ground_truth(a=a, b=b, c=c, noise=0.0)
         f = self._fit(C, d)
-        # Not exactly b because midpoint depends on d_max, but should be in same ballpark
-        assert f.observed_half_life == pytest.approx(b, rel=0.3)
+        assert f.observed_half_life == pytest.approx(b / d.max(), rel=0.3)
 
     def test_aic_better_than_constant_on_saturating_data(self):
         C, d = self._ground_truth(a=5.0, b=2.0, c=0.5, noise=0.05)
