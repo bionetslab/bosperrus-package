@@ -22,6 +22,7 @@ dependencies = ["scikit-learn",
 [project.optional-dependencies]
 dev = ["pytest"]
 graph = ["graph-tool"] # this will fail, only to document intent
+alphashape = ["alphashape", "shapely"]
 
 [project.urls]
 Homepage = "https://github.com/bionetslab/bosperrus-package"

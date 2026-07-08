@@ -6,6 +6,7 @@ from bosperrus.distances import (
     distance_to_convex_hull,
     distance_to_pointset,
     distance_to_mask,
+    distance_to_alpha_shape,
 )
 
 
@@ -171,3 +172,97 @@ def test_distance_to_mask_2d():
     assert d_far_outside.min() > d_near_outside.max(), (
         "Pixels far from the foreground block should have larger distance than nearby ones"
     )
+
+
+# ---------------------------------------------------------------------------
+# distance_to_alpha_shape
+# ---------------------------------------------------------------------------
+
+alphashape = pytest.importorskip("alphashape", reason="alphashape not installed")
+
+
+def test_distance_to_alpha_shape_returns_series():
+    rng = np.random.default_rng(42)
+    coords = rng.uniform(0, 100, (60, 2))
+    result = distance_to_alpha_shape(coords, alpha=0)
+    assert isinstance(result, pd.Series)
+    assert len(result) == 60
+    assert result.name == "distance_to_alpha_shape"
+
+
+def test_distance_to_alpha_shape_nonnegative():
+    rng = np.random.default_rng(42)
+    coords = rng.uniform(0, 100, (60, 2))
+    result = distance_to_alpha_shape(coords, alpha=0)
+    assert (result >= 0).all()
+
+
+def test_distance_to_alpha_shape_interior_farther_than_boundary():
+    """Dense ring of points: the centre has larger alpha-shape distance than the ring."""
+    angles = np.linspace(0, 2 * np.pi, 80, endpoint=False)
+    ring = np.column_stack([10 * np.cos(angles), 10 * np.sin(angles)])
+    centre = np.array([[0.0, 0.0]])
+    coords = np.vstack([ring, centre])
+    d = distance_to_alpha_shape(coords, alpha=0)
+    assert d.iloc[-1] > d.iloc[:-1].max() * 0.5, (
+        "Centre point should have clearly larger distance than the ring boundary"
+    )
+
+
+def test_distance_to_alpha_shape_concave_boundary():
+    """Alpha shape with sufficient alpha follows concavities; distances near the
+    concave notch should be small, not inflated as the convex hull would give."""
+    # U-shape: left column, right column, connecting base — opens upward
+    left   = np.column_stack([np.zeros(20),        np.linspace(0, 10, 20)])
+    right  = np.column_stack([np.full(20, 10.0),   np.linspace(0, 10, 20)])
+    bottom = np.column_stack([np.linspace(0, 10, 15), np.zeros(15)])
+    # Point inside the U gap (near the open top, between the two arms)
+    gap_pt = np.array([[5.0, 8.0]])
+    coords = np.vstack([left, right, bottom, gap_pt])
+
+    # With alpha=0 (convex hull), the gap point is interior → large distance
+    d_convex = distance_to_alpha_shape(coords, alpha=0)
+    # With a concave alpha, the boundary wraps around the gap → smaller distance
+    d_concave = distance_to_alpha_shape(coords, alpha=0.3)
+
+    gap_idx = len(coords) - 1
+    assert d_concave.iloc[gap_idx] < d_convex.iloc[gap_idx], (
+        "Alpha shape should give smaller distance for a point in a concave gap "
+        "than the convex hull (alpha=0) does"
+    )
+
+
+def test_distance_to_alpha_shape_requires_2d():
+    coords = np.ones((10, 3))
+    with pytest.raises(ValueError, match="Nx2"):
+        distance_to_alpha_shape(coords, alpha=0)
+
+
+def test_distance_to_alpha_shape_requires_at_least_3_points():
+    coords = np.array([[0.0, 0.0], [1.0, 0.0]])
+    with pytest.raises(ValueError, match="3 points"):
+        distance_to_alpha_shape(coords, alpha=0)
+
+
+def test_distance_to_alpha_shape_multipolygon_warns():
+    """Alpha that splits the shape into fragments should raise a UserWarning."""
+    # Two well-separated clusters: a large enough alpha will produce one hull,
+    # but an intermediate alpha that keeps only within-cluster edges produces
+    # two disconnected polygons.
+    cluster_a = np.random.default_rng(0).uniform(0, 1, (30, 2))
+    cluster_b = np.random.default_rng(1).uniform(10, 11, (30, 2))
+    coords = np.vstack([cluster_a, cluster_b])
+    # alpha small enough to keep intra-cluster triangles but too small to
+    # bridge the gap between clusters → MultiPolygon
+    with pytest.warns(UserWarning, match="MultiPolygon"):
+        distance_to_alpha_shape(coords, alpha=2.0)
+
+
+def test_distance_to_alpha_shape_empty_raises():
+    """Alpha large enough to exclude all Delaunay triangles → empty shape."""
+    # Five points spread over a 1000x1000 grid produce large circumradii;
+    # alpha=0.01 (threshold = 100 units) excludes all triangles → empty.
+    rng = np.random.default_rng(42)
+    coords = rng.uniform(0, 1000, (5, 2))
+    with pytest.raises(ValueError, match="empty"):
+        distance_to_alpha_shape(coords, alpha=0.01)
