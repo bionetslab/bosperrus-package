@@ -354,9 +354,10 @@ class PiecewiseLinearFit(Fit):
         c_center = self.piecewise_plateau(d_max, self.params["piecewise_linear_b"], self.params["piecewise_linear_m"], self.params["piecewise_linear_c"])
         
         self._observed_effect_strength = (c_border - c_center) / (c_border + c_center + _EPS)
-        
+
         y_mid = (c_border + c_center) / 2
-        self._observed_half_life = (y_mid - self.params["piecewise_linear_c"]) / (self.params["piecewise_linear_m"] + _EPS)
+        raw_half_life = (y_mid - self.params["piecewise_linear_c"]) / (self.params["piecewise_linear_m"] + _EPS)
+        self._observed_half_life = raw_half_life / (d_max + _EPS)
 
     def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
         """
@@ -451,9 +452,10 @@ class ExponentialSaturationFit(Fit):
         c_center = self.exp_sat(d_max, self.params["exponential_saturation_a"], self.params["exponential_saturation_b"], self.params["exponential_saturation_c"])
         
         self._observed_effect_strength = (c_border - c_center) / (c_border + c_center + _EPS)
-        
+
         C_mid = (c_border + c_center) / 2
-        self._observed_half_life = -(1 / self.params["exponential_saturation_b"]) * np.log(1 - (C_mid - self.params["exponential_saturation_c"]) / (self.params["exponential_saturation_a"] + _EPS))
+        raw_half_life = -(1 / self.params["exponential_saturation_b"]) * np.log(1 - (C_mid - self.params["exponential_saturation_c"]) / (self.params["exponential_saturation_a"] + _EPS))
+        self._observed_half_life = raw_half_life / (d_max + _EPS)
 
     def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
         """
@@ -553,9 +555,10 @@ class MichaelisMentenFit(Fit):
         c_center = self.michaelis_menten(d_max, self.params["michaelis_menten_a"], self.params["michaelis_menten_b"], self.params["michaelis_menten_c"])
         
         self._observed_effect_strength = (c_border - c_center) / (c_border + c_center + _EPS)
-        
+
         C_mid = (c_border + c_center) / 2
-        self._observed_half_life = self.params["michaelis_menten_b"] * (C_mid - self.params["michaelis_menten_c"]) / (self.params["michaelis_menten_a"] - C_mid + self.params["michaelis_menten_c"] + _EPS)
+        raw_half_life = self.params["michaelis_menten_b"] * (C_mid - self.params["michaelis_menten_c"]) / (self.params["michaelis_menten_a"] - C_mid + self.params["michaelis_menten_c"] + _EPS)
+        self._observed_half_life = raw_half_life / (d_max + _EPS)
 
     def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
         """
