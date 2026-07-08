@@ -1,6 +1,6 @@
 [project]
 name = "bosperrus"
-version = "0.0.0"
+version = "0.1.0"
 authors = [
   { name="Anna Moeller", email="anna.moeller@fau.de" },
 ]
