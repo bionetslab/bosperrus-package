@@ -3,7 +3,8 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree, ConvexHull, distance
 
-__all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_to_mask', 'distance_to_convex_hull']
+__all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_to_mask',
+           'distance_to_convex_hull', 'distance_to_alpha_shape']
 
 
 def distance_to_rectangular_border(coords):
@@ -150,3 +151,69 @@ def distance_to_convex_hull(coords):
             raise ValueError("Unexpected hull simplex shape.")
 
     return pd.Series(d_min, name="distance_to_convex_hull")
+
+
+def distance_to_alpha_shape(coords, alpha):
+    """Compute distance from each point to the boundary of the alpha shape
+    (concave hull) of the point cloud.
+
+    The alpha shape generalises the convex hull: larger ``alpha`` values
+    produce more concave (tighter) boundaries that follow nooks and crannies
+    in the data; ``alpha=0`` recovers the convex hull. Too large an ``alpha``
+    may produce an empty geometry — inspect the result visually before use.
+
+    Only 2-D coordinates are supported.
+
+    Parameters
+    ----------
+    coords : array-like, shape (N, 2)
+        2-D node coordinates.
+    alpha : float
+        Concaveness parameter. ``alpha=0`` gives the convex hull limit.
+
+    Returns
+    -------
+    pd.Series
+        Named ``"distance_to_alpha_shape"``. Distance of each point to the
+        nearest point on the alpha shape boundary, in the same units as
+        ``coords``.
+
+    Raises
+    ------
+    ImportError
+        If ``alphashape`` is not installed.
+    ValueError
+        If ``coords`` is not Nx2, has fewer than 3 rows, or the resulting
+        alpha shape is empty (try a smaller ``alpha``).
+    """
+    try:
+        import alphashape
+    except ImportError:
+        raise ImportError(
+            "alphashape is required for distance_to_alpha_shape. "
+            "Install it with: pip install alphashape"
+        )
+    import shapely
+
+    coords = np.asarray(coords, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] != 2:
+        raise ValueError(
+            "Spatial coordinates must be Nx2 for distance_to_alpha_shape."
+        )
+    if len(coords) < 3:
+        raise ValueError(
+            "At least 3 points are required to compute an alpha shape."
+        )
+
+    shape = alphashape.alphashape(coords, alpha)
+
+    if shape is None or shape.is_empty:
+        raise ValueError(
+            f"Alpha shape is empty for alpha={alpha}. Try a smaller alpha value."
+        )
+
+    boundary = shape.boundary
+    point_geoms = shapely.points(coords)
+    d_vals = shapely.distance(point_geoms, boundary)
+
+    return pd.Series(d_vals, name="distance_to_alpha_shape")
