@@ -85,8 +85,18 @@ class Flow():
         # there's no cross-dataset-comparability need here, and dividing by N
         # would artificially flatten the weights for large N. See
         # evaluate_fit.scaled_relative_likelihood's docstring.
-        rel_ll = [fit_instance.relative_likelihood_over_baseline for fit_instance in fit_instances if fit_instance != baseline_fit]
-        entropy = calculate_AIC_weight_entropy(np.array(rel_ll))
+        #
+        # Referenced against the *minimum* AIC among the compared fits here
+        # (not baseline_fit.AIC, unlike relative_likelihood_over_baseline) --
+        # entropy is shift-invariant, so this doesn't change the result, but it
+        # keeps every exponent <= 0 and so never overflows. Referencing against
+        # baseline_fit.AIC directly can overflow to inf when a model fits far
+        # better than baseline (common with large N), corrupting the entropy
+        # via inf/inf or x/inf in the normalization below.
+        non_baseline_fits = [fit_instance for fit_instance in fit_instances if fit_instance != baseline_fit]
+        aics = np.array([fit_instance.AIC for fit_instance in non_baseline_fits])
+        rel_ll = relative_likelihood(aics, aics.min())
+        entropy = calculate_AIC_weight_entropy(rel_ll)
         
         i = 0
         for fit in fit_instances:

@@ -20,8 +20,14 @@ def relative_likelihood(aic_model, aic_baseline):
     ΔAIC = aic_model - aic_baseline. This is the correct input for AIC
     weights/entropy across a fixed set of models fit to the same N
     observations. Do not further divide by N for that purpose — see
-    scaled_relative_likelihood, which does that for a different reason."""
-    return np.exp((aic_baseline - aic_model) / 2)
+    scaled_relative_likelihood, which does that for a different reason.
+
+    Can legitimately overflow to +inf when aic_model is far better than
+    aic_baseline (a real, meaningful "infinitely more likely" result, not an
+    error) -- silenced here rather than left to warn on every such call.
+    """
+    with np.errstate(over="ignore"):
+        return np.exp((aic_baseline - aic_model) / 2)
 
 def scaled_relative_likelihood(aic_model, aic_baseline, N):
     """Sample-size-normalized relative likelihood: exp(-ΔAIC / (2N)). Puts the
