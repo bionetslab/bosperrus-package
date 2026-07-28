@@ -139,6 +139,24 @@ class TestFlowExecution:
         assert list(flow.observations.index) == idx
         assert not corrected.isna().all(), "corrected column came back all-NaN"
 
+    def test_entropy_finite_when_far_better_than_baseline(self):
+        """Regression: a model can fit far better than the ConstantFit baseline
+        (large N, clean signal -- common with real datasets), which overflows
+        relative_likelihood_over_baseline (referenced against baseline_fit.AIC)
+        to inf. entropy_AIC_weights must stay finite regardless, since
+        _set_entropy_weights references against the minimum AIC among the
+        compared fits instead (shift-invariant, never overflows)."""
+        n = 5000
+        d = np.linspace(0, 10, n)
+        s = 5.0 * (1 - np.exp(-2 * d)) + RNG.normal(0, 0.001, n)
+
+        flow = Flow.from_distances_and_scores(distances=d, scores=pd.DataFrame({"degree": s}))
+        flow.flow()
+
+        entropy = flow.best_fits["degree"].entropy_AIC_weights
+        assert np.isfinite(entropy), f"entropy_AIC_weights was not finite: {entropy}"
+        assert -1e-9 <= entropy <= 1.0 + 1e-9
+
     def test_corrected_columns_have_correct_length(self, run_flow):
         """Corrected columns should have the same length as the input."""
         flow = run_flow
