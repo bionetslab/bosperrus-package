@@ -153,13 +153,22 @@ class Fit():
         return self._name
 
     def _expand_to_original_index(self, filtered_data):
-        """Expand filtered data back to original index."""
+        """Expand filtered data back to original index.
+
+        Uses self._S_true_original's own index (e.g. adata.obs_names) rather
+        than a bare range(N) -- otherwise callers that assign S_corrected into
+        a DataFrame keyed by that same original index (as Flow.flow() does)
+        get silent label-alignment mismatches, and the assigned column comes
+        back all-NaN. Falls back to range(N) for plain arrays, which have no
+        index to preserve.
+        """
+        original_index = self._S_true_original.index if hasattr(self._S_true_original, "index") else range(len(self._S_true_original))
         if isinstance(self._S_true_original, pd.DataFrame):
-            result = pd.DataFrame(np.nan, index=range(len(self._S_true_original)), columns=self._S_true_original.columns)
+            result = pd.DataFrame(np.nan, index=original_index, columns=self._S_true_original.columns)
             result[self._mask] = filtered_data
             return result
-        else:  # pd.Series
-            result = pd.Series(np.nan, index=range(len(self._S_true_original)), dtype=filtered_data.dtype)
+        else:  # pd.Series or ndarray
+            result = pd.Series(np.nan, index=original_index, dtype=filtered_data.dtype)
             result[self._mask] = filtered_data
             return result
 

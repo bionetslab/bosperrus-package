@@ -130,10 +130,15 @@ class Flow():
         self.best_fits = dict()
         fit_quality_data = dict()
 
-        d = self.observations[self._distance_key].values
+        # Deliberately NOT .values here: Fit._expand_to_original_index() rebuilds
+        # S_corrected against S_true's own index, so passing the real
+        # (possibly non-default, e.g. adata.obs_names) index through lets
+        # `self.observations[col] = best_fit.S_corrected` below label-align
+        # correctly instead of silently coming back all-NaN.
+        d = self.observations[self._distance_key]
 
         for score_name in score_names:
-            S = self.observations[score_name].values
+            S = self.observations[score_name]
 
             baseline_fit = baseline_fit_class(S, d)
             baseline_fit.fit()

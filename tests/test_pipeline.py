@@ -118,6 +118,27 @@ class TestFlowExecution:
         actual = set(flow.fit_quality.columns)
         assert actual == expected, f"fit_quality columns mismatch: {actual} != {expected}"
 
+    def test_flow_preserves_non_default_index(self):
+        """Regression: with a non-default index (e.g. adata.obs_names), the
+        'BOSPERRUS corrected {measure}' column used to come back all-NaN.
+        Fit._expand_to_original_index() rebuilt a bare range(N) index for
+        S_corrected, and Flow.flow()'s self.observations[col] = S_corrected
+        then failed to label-align against observations's real index."""
+        n = 20
+        idx = [f"cell_{i}" for i in range(n)]
+        distances = pd.Series(np.linspace(0.5, 10.0, n), index=idx, name="distance")
+        scores = pd.DataFrame(
+            {"degree": 2.0 * (1 - np.exp(-0.3 * distances.values)) + RNG.normal(0, 0.05, n)},
+            index=idx,
+        )
+
+        flow = Flow.from_distances_and_scores(distances=distances, scores=scores)
+        flow.flow()
+
+        corrected = flow.observations["BOSPERRUS corrected degree"]
+        assert list(flow.observations.index) == idx
+        assert not corrected.isna().all(), "corrected column came back all-NaN"
+
     def test_corrected_columns_have_correct_length(self, run_flow):
         """Corrected columns should have the same length as the input."""
         flow = run_flow
