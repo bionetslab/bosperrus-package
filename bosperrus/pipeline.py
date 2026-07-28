@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from .fit import ConstantFit, MichaelisMentenFit, PiecewiseLinearFit, ExponentialSaturationFit
-from .evaluate_fit import relative_likelihood, calculate_AIC_weight_entropy
+from .evaluate_fit import relative_likelihood, scaled_relative_likelihood, calculate_AIC_weight_entropy
 from .graph_construction import construct_graph
 from .centrality_measures import compute_centrality_measures
 
@@ -80,7 +80,12 @@ class Flow():
 
     @staticmethod
     def _set_entropy_weights(fit_instances, baseline_fit):
-        rel_ll = [fit_instance.scaled_relative_loglikelihood_over_baseline for fit_instance in fit_instances if fit_instance != baseline_fit]
+        # Uses the unscaled relative_likelihood (not scaled_relative_likelihood):
+        # AIC weights/entropy compare models fit to the same N observations, so
+        # there's no cross-dataset-comparability need here, and dividing by N
+        # would artificially flatten the weights for large N. See
+        # evaluate_fit.scaled_relative_likelihood's docstring.
+        rel_ll = [fit_instance.relative_likelihood_over_baseline for fit_instance in fit_instances if fit_instance != baseline_fit]
         entropy = calculate_AIC_weight_entropy(np.array(rel_ll))
         
         i = 0
@@ -140,7 +145,8 @@ class Flow():
                     continue
                 fit_instance = fit_class(S, d)
                 fit_instance.fit_correct()
-                fit_instance.scaled_relative_loglikelihood_over_baseline = relative_likelihood(fit_instance.AIC, baseline_aic,  len(d))
+                fit_instance.relative_likelihood_over_baseline = relative_likelihood(fit_instance.AIC, baseline_aic)
+                fit_instance.scaled_relative_loglikelihood_over_baseline = scaled_relative_likelihood(fit_instance.AIC, baseline_aic, len(d))
                 fit_instances.append(fit_instance)
 
             fit_instances.append(baseline_fit)
