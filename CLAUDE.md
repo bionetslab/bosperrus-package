@@ -8,9 +8,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-**Install (editable):**
+**Install:** `bosperrus` is published on PyPI, so most consumers just need:
 ```bash
-pip install -e /data/bionets/je30bery/bosperrus-package/
+pip install bosperrus
+```
+When developing the package itself (this directory), install it editable instead:
+```bash
+cd /home/woody/iwbn/iwbn007h/bosperrus/bosperrus-package
+pip install -e .
 ```
 
 **Centrality measures require graph-tool, which must be installed via conda (not pip):**
@@ -20,7 +25,7 @@ conda install graph-tool -c conda-forge
 
 **Run all tests:**
 ```bash
-cd /data/bionets/je30bery/bosperrus-package
+cd /home/woody/iwbn/iwbn007h/bosperrus/bosperrus-package
 pytest tests/
 ```
 
@@ -97,24 +102,25 @@ Stateless functions:
 
 ### `graph_construction.py`
 
-- `knn_edges(coords, k)` → directed edges as `set` of `(u, v)` tuples (asymmetric)
-- `rnn_edges(coords, r)` → undirected edges as `set` of `frozenset({u, v})`
-- `delaunay_edges(coords)` → undirected edges as `set` of `frozenset({u, v})`
-- `construct_graph(coords, graph_type, k=None, r=None)` → dispatches to the above
+- `knn_edges(coordinates, k)` → directed edges as `set` of `(u, v)` tuples (asymmetric)
+- `rnn_edges(coordinates, r)` → undirected edges as `set` of `frozenset({u, v})`
+- `delaunay_edges(coordinates)` → undirected edges as `set` of `frozenset({u, v})`
+- `construct_graph(coordinates, graph_type, k=None, r=None)` → dispatches to the above
 
 kNN edges are directed tuples; Delaunay and rNN edges are undirected frozensets. This asymmetry matters anywhere edge sets are compared or passed to downstream functions.
 
 ### `distances.py`
 
 All functions return a named `pd.Series` with one distance value per node:
-- `distance_to_convex_hull(coords)` — works for 2-D and 3-D
-- `distance_to_rectangular_border(coords)` — 2-D only; min distance to any of the four sides
-- `distance_to_pointset(coords, pointset)` — nearest-neighbour distance via `cKDTree`
-- `distance_to_mask(coords, mask)` — `distance_transform_edt` on inverted binary mask
+- `distance_to_convex_hull(coordinates)` — works for 2-D and 3-D
+- `distance_to_rectangular_border(coordinates)` — 2-D only; min distance to any of the four sides
+- `distance_to_pointset(coordinates, pointset)` — nearest-neighbour distance via `cKDTree`
+- `distance_to_mask(coordinates, mask)` — `distance_transform_edt` on inverted binary mask
+- `distance_to_alpha_shape(coordinates, alpha)` — 2-D only; requires the optional `alphashape`/`shapely` extra (`pip install bosperrus[alphashape]`); distance to the boundary of the alpha shape (concave hull)
 
 ### `centrality_measures.py`
 
-`compute_centrality_measures(edge_list, N, measures)` — requires `graph-tool` at import time. If `graph-tool` is absent the module imports silently but every call raises `ImportError`. Supported measures: `"degree"`, `"pagerank"`, `"betweenness"`, `"closeness"`, `"harmonic"`, `"clustering"`. Isolated nodes (present in `N` but not in `edge_list`) are zero-padded so the output always has exactly `N` rows.
+`compute_centrality_measures(edge_list, N, measures, backend=None)` — dispatches to graph-tool if installed, else falls back to networkx (`HAS_GRAPH_TOOL`/`HAS_NETWORKX` flags checked at call time); `backend="graph_tool"` or `"networkx"` forces one explicitly. Only raises `ImportError` if the requested/available backend is truly missing. Supported measures: `"degree"`, `"pagerank"`, `"betweenness"`, `"closeness"`, `"harmonic"`, `"clustering"`. Isolated nodes (present in `N` but not in `edge_list`) are zero-padded so the output always has exactly `N` rows.
 
 ## Tests
 
