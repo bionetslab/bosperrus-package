@@ -71,6 +71,7 @@ class Fit():
         # from outside after construction, whereas everything else here is computed and set
         # by the Fit instance on itself.
         self.entropy_AIC_weights = None
+        self.relative_likelihood_over_baseline = None
         self.scaled_relative_loglikelihood_over_baseline = None
 
     def __repr__(self):
@@ -93,6 +94,7 @@ class Fit():
             "observed_effect_strength": self.observed_effect_strength,
             "included samples": self.included_samples,
             "affected samples": self.fraction_not_converged,
+            "relative_likelihood_over_baseline": self.relative_likelihood_over_baseline,
             "scaled_relative_likelihood_over_baseline": self.scaled_relative_loglikelihood_over_baseline,
         }
         summary.update(self.params)

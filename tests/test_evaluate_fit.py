@@ -5,7 +5,10 @@ Coverage:
 - log_likelihood: finite result for noisy data; very large finite positive for perfect fit (sigma2 floored)
 - akaike_information_criterion: exact formula check (2*k - 2*ll, no +1 here — +1 is
   added by _score() in Fit, not by the bare AIC function)
-- relative_likelihood: same AIC → 1.0; lower AIC model → > 1.0
+- relative_likelihood: same AIC → 1.0; lower AIC model → > 1.0; unaffected by N
+- scaled_relative_likelihood: same as relative_likelihood but divided by N in
+  the exponent, so it shrinks toward 1.0 (not toward relative_likelihood's
+  value) as N grows for a fixed AIC gap
 - calculate_AIC_weight_entropy: single element → 0.0, uniform → ~1.0, skewed → near 0.0
 """
 
@@ -16,6 +19,7 @@ from bosperrus.evaluate_fit import (
     log_likelihood,
     akaike_information_criterion,
     relative_likelihood,
+    scaled_relative_likelihood,
     calculate_AIC_weight_entropy,
 )
 
@@ -107,33 +111,74 @@ class TestRelativeLikelihood:
     def test_relative_likelihood_same_aic(self):
         """Same model vs itself: relative likelihood == 1.0."""
         aic = 42.0
-        N = 100
-        rl = relative_likelihood(aic_model=aic, aic_baseline=aic, N=N)
+        rl = relative_likelihood(aic_model=aic, aic_baseline=aic)
         assert rl == pytest.approx(1.0), f"Expected 1.0, got {rl}"
 
     def test_relative_likelihood_lower_aic_is_better(self):
         """A model with AIC 10 lower than the baseline should have rl > 1.0."""
         aic_baseline = 50.0
         aic_model = 40.0  # 10 lower = better
-        N = 100
-        rl = relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline, N=N)
+        rl = relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline)
         assert rl > 1.0, f"Better model should have relative likelihood > 1.0, got {rl}"
 
     def test_relative_likelihood_higher_aic_is_worse(self):
         """A model with AIC higher than baseline should have rl < 1.0."""
         aic_baseline = 50.0
         aic_model = 60.0  # worse
-        N = 100
-        rl = relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline, N=N)
+        rl = relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline)
         assert rl < 1.0, f"Worse model should have relative likelihood < 1.0, got {rl}"
 
-    def test_relative_likelihood_scaled_by_N(self):
+    def test_relative_likelihood_matches_standard_akaike_weight_numerator(self):
+        """relative_likelihood(aic_model, aic_baseline) == exp(-(aic_model - aic_baseline)/2),
+        the textbook (unscaled) Akaike weight numerator -- and does not depend on N."""
+        aic_baseline, aic_model = 50.0, 40.0
+        expected = np.exp(-(aic_model - aic_baseline) / 2)
+        assert relative_likelihood(aic_model, aic_baseline) == pytest.approx(expected)
+
+
+# ============================================================
+# scaled_relative_likelihood
+# ============================================================
+
+class TestScaledRelativeLikelihood:
+
+    def test_scaled_relative_likelihood_same_aic(self):
+        """Same model vs itself: scaled relative likelihood == 1.0."""
+        aic = 42.0
+        N = 100
+        rl = scaled_relative_likelihood(aic_model=aic, aic_baseline=aic, N=N)
+        assert rl == pytest.approx(1.0), f"Expected 1.0, got {rl}"
+
+    def test_scaled_relative_likelihood_lower_aic_is_better(self):
+        """A model with AIC 10 lower than the baseline should have rl > 1.0."""
+        aic_baseline = 50.0
+        aic_model = 40.0  # 10 lower = better
+        N = 100
+        rl = scaled_relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline, N=N)
+        assert rl > 1.0, f"Better model should have relative likelihood > 1.0, got {rl}"
+
+    def test_scaled_relative_likelihood_higher_aic_is_worse(self):
+        """A model with AIC higher than baseline should have rl < 1.0."""
+        aic_baseline = 50.0
+        aic_model = 60.0  # worse
+        N = 100
+        rl = scaled_relative_likelihood(aic_model=aic_model, aic_baseline=aic_baseline, N=N)
+        assert rl < 1.0, f"Worse model should have relative likelihood < 1.0, got {rl}"
+
+    def test_scaled_relative_likelihood_scaled_by_N(self):
         """Larger N reduces the per-sample AIC difference effect."""
         delta = 10.0
-        rl_small_N = relative_likelihood(0.0, delta, N=10)
-        rl_large_N = relative_likelihood(0.0, delta, N=1000)
+        rl_small_N = scaled_relative_likelihood(0.0, delta, N=10)
+        rl_large_N = scaled_relative_likelihood(0.0, delta, N=1000)
         # With large N the exponent shrinks: exp(delta/2N) is smaller
         assert rl_small_N > rl_large_N
+
+    def test_scaled_relative_likelihood_approaches_one_for_large_N(self):
+        """For a fixed AIC gap, scaled_relative_likelihood -> 1.0 as N grows --
+        this is exactly why it must not be used for AIC weights/entropy."""
+        delta = 10.0
+        rl_huge_N = scaled_relative_likelihood(0.0, delta, N=1_000_000)
+        assert rl_huge_N == pytest.approx(1.0, abs=1e-3)
 
 
 # ============================================================
