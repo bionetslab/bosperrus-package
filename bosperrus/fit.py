@@ -4,6 +4,7 @@ from scipy.optimize import curve_fit, differential_evolution
 from .evaluate_fit import log_likelihood, akaike_information_criterion
 
 _EPS = 1e-10
+_DEFAULT_CONVERGENCE_THRESHOLD = 0.95
 
 __all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'MichaelisMentenFit']
 
@@ -64,7 +65,11 @@ class Fit():
         self._converged = False # not really meaningful to outside
         self._name = None
         
-        # These are only modified when fits are compared against each other from the Flow class
+        # These are only modified when fits are compared against each other from the Flow class.
+        # Unlike every other stateful field above, they're deliberately plain public attributes
+        # (not private + read-only property): Flow._set_entropy_weights() writes to them
+        # from outside after construction, whereas everything else here is computed and set
+        # by the Fit instance on itself.
         self.entropy_AIC_weights = None
         self.scaled_relative_loglikelihood_over_baseline = None
 
@@ -216,6 +221,20 @@ class Fit():
         self._AIC = akaike_information_criterion(len(self.params) + 1, self.log_likelihood) # +1 for the variance term in the likelihood, which is estimated from the residuals and thus counts as an additional parameter
         return
 
+    def _finalize_fit(self):
+        """Shared post-fit-attempt bookkeeping, called by every subclass's fit()
+        after self._params/_S_model/_converged have been set (on both success and
+        failure). _rate_observed_metrics() and _calculate_fraction_not_converged()
+        each handle the not-converged case internally (producing NaN), so they can
+        always be called unconditionally here. _score() is the one exception: it
+        must only run on a successful fit, since a failed fit's degenerate
+        S_model == S_true would otherwise score as a perfect fit under AIC.
+        """
+        self._rate_observed_metrics()
+        self._calculate_fraction_not_converged()
+        if self._converged:
+            self._score()
+
 
 class ConstantFit(Fit):
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series = None):
@@ -249,22 +268,21 @@ class ConstantFit(Fit):
         self._observed_effect_strength = 0
         self._observed_half_life = 0
 
-    def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
         """
         A constant function is trivially converged everywhere.
         Returns 0.0 regardless of threshold.
         """
         self._fraction_not_converged = 0.0
+        return self._fraction_not_converged
 
     def fit(self):
         c, S_model = self._fit_constant(self._S_true)
         self._S_model = S_model
         self._S_corrected = self._S_true
         self._params = {"constant_c": c}
-        self._rate_observed_metrics()
-        self._calculate_fraction_not_converged()
-        self._score()
         self._converged = True
+        self._finalize_fit()
 
     def correct(self):
         if self._params is None:
@@ -359,7 +377,7 @@ class PiecewiseLinearFit(Fit):
         raw_half_life = (y_mid - self.params["piecewise_linear_c"]) / (self.params["piecewise_linear_m"] + _EPS)
         self._observed_half_life = raw_half_life / (d_max + _EPS)
 
-    def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
         """
         For the piecewise linear model, convergence is structurally defined by the
         knot b: nodes at d > b are on the plateau and fully converged. Nodes at d <= b
@@ -373,9 +391,10 @@ class PiecewiseLinearFit(Fit):
             raise ValueError("Model has not been fitted yet")
         if not self._converged:
             self._fraction_not_converged = np.nan
-            return
+            return self._fraction_not_converged
         b = self.params["piecewise_linear_b"]
         self._fraction_not_converged = float(np.mean(self._d <= b))
+        return self._fraction_not_converged
 
     def fit(self, refine_fit=True):
         try:
@@ -388,14 +407,7 @@ class PiecewiseLinearFit(Fit):
             self._S_model = self._S_true
             self._converged = False
 
-        if self._converged:
-            self._rate_observed_metrics()
-            self._calculate_fraction_not_converged()
-            self._score()
-        else:
-            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
-            self._rate_observed_metrics()
-            self._fraction_not_converged = np.nan
+        self._finalize_fit()
 
     def correct(self):
         if self._params is None:
@@ -457,7 +469,7 @@ class ExponentialSaturationFit(Fit):
         raw_half_life = -(1 / self.params["exponential_saturation_b"]) * np.log(1 - (C_mid - self.params["exponential_saturation_c"]) / (self.params["exponential_saturation_a"] + _EPS))
         self._observed_half_life = raw_half_life / (d_max + _EPS)
 
-    def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
         """
         The exponential saturation a*(1 - exp(-b*d)) + c asymptotes to a + c.
         A point is considered converged once it has reached `threshold` of the
@@ -472,12 +484,13 @@ class ExponentialSaturationFit(Fit):
             raise ValueError("Model has not been fitted yet")
         if not self._converged:
             self._fraction_not_converged = np.nan
-            return
+            return self._fraction_not_converged
         if not (0 < threshold < 1):
             raise ValueError("threshold must be in (0, 1)")
         b = self.params["exponential_saturation_b"]
         d_converge = -np.log(1 - threshold) / b
         self._fraction_not_converged = float(np.mean(self._d < d_converge))
+        return self._fraction_not_converged
 
     def fit(self):
         try:
@@ -490,14 +503,7 @@ class ExponentialSaturationFit(Fit):
             self._params = {"exponential_saturation_a": np.nan, "exponential_saturation_b": np.nan, "exponential_saturation_c": np.nan}
             self._S_model = self._S_true
 
-        if self._converged:
-            self._rate_observed_metrics()
-            self._calculate_fraction_not_converged()
-            self._score()
-        else:
-            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
-            self._rate_observed_metrics()
-            self._fraction_not_converged = np.nan
+        self._finalize_fit()
 
     def correct(self):
         if self._params is None:
@@ -560,7 +566,7 @@ class MichaelisMentenFit(Fit):
         raw_half_life = self.params["michaelis_menten_b"] * (C_mid - self.params["michaelis_menten_c"]) / (self.params["michaelis_menten_a"] - C_mid + self.params["michaelis_menten_c"] + _EPS)
         self._observed_half_life = raw_half_life / (d_max + _EPS)
 
-    def _calculate_fraction_not_converged(self, threshold: float = 0.95) -> float:
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
         """
         The Michaelis-Menten function a*d/(b+d) + c asymptotes to a + c.
         A point is considered converged once the saturable term a*d/(b+d)
@@ -578,12 +584,13 @@ class MichaelisMentenFit(Fit):
             raise ValueError("Model has not been fitted yet")
         if not self._converged:
             self._fraction_not_converged = np.nan
-            return
+            return self._fraction_not_converged
         if not (0 < threshold < 1):
             raise ValueError("threshold must be in (0, 1)")
         b = self.params["michaelis_menten_b"]
         d_converge = b * threshold / (1 - threshold)
         self._fraction_not_converged = float(np.mean(self._d < d_converge))
+        return self._fraction_not_converged
 
     def fit(self):
         try:
@@ -596,14 +603,7 @@ class MichaelisMentenFit(Fit):
             self._S_model = self._S_true
             self._converged = False
 
-        if self._converged:
-            self._rate_observed_metrics()
-            self._calculate_fraction_not_converged()
-            self._score()
-        else:
-            # B3 fix: set fraction_not_converged to np.nan (not None) when fit fails
-            self._rate_observed_metrics()
-            self._fraction_not_converged = np.nan
+        self._finalize_fit()
 
 
     def correct(self):

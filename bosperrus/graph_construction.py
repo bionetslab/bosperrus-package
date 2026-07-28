@@ -23,10 +23,10 @@ def construct_graph(coordinates, graph_type, k=None, r=None):
     return edge_list
     
     
-def knn_edges(coords, k):
+def knn_edges(coordinates, k):
     """Directed, asymmetric kNN on full set."""
-    nbrs = NearestNeighbors(n_neighbors=int(k) + 1).fit(coords)
-    _, indices = nbrs.kneighbors(coords)
+    nbrs = NearestNeighbors(n_neighbors=int(k) + 1).fit(coordinates)
+    _, indices = nbrs.kneighbors(coordinates)
 
     edges = set()
     for u, neighbors in enumerate(indices):
@@ -35,10 +35,10 @@ def knn_edges(coords, k):
     return edges
 
 
-def rnn_edges(coords, r):
+def rnn_edges(coordinates, r):
     """Undirected rNN on full set."""
-    nbrs = NearestNeighbors(radius=r).fit(coords)
-    _, indices = nbrs.radius_neighbors(coords, radius=r)
+    nbrs = NearestNeighbors(radius=r).fit(coordinates)
+    _, indices = nbrs.radius_neighbors(coordinates, radius=r)
 
     edges = set()
     for u, neighbors in enumerate(indices):
@@ -48,9 +48,9 @@ def rnn_edges(coords, r):
     return edges
 
 
-def delaunay_edges(coords):
+def delaunay_edges(coordinates):
     """Undirected Delaunay on full set."""
-    tri = Delaunay(coords)
+    tri = Delaunay(coordinates)
     edges = set()
 
     for simplex in tri.simplices:

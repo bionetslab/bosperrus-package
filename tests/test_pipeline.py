@@ -167,10 +167,10 @@ class TestDataImmutability:
 class TestErrorHandling:
 
     def test_invalid_measure_raises_value_error(self):
-        """Calling flow(measures=['nonexistent']) should raise ValueError, not AssertionError."""
+        """Calling flow(score_names=['nonexistent']) should raise ValueError, not AssertionError."""
         flow = Flow.from_distances_and_scores(distances=DISTANCES, scores=SCORES)
         with pytest.raises(ValueError, match="nonexistent"):
-            flow.flow(measures=["nonexistent"])
+            flow.flow(score_names=["nonexistent"])
 
     def test_baseline_not_in_fits_raises_value_error(self):
         """baseline_fit_class not in fits should raise ValueError."""
@@ -214,7 +214,7 @@ class TestSubsetMeasures:
     def test_flow_with_single_measure(self):
         """Passing a single measure to flow() should work and only populate that measure."""
         flow = Flow.from_distances_and_scores(distances=DISTANCES, scores=SCORES)
-        flow.flow(measures=["measure_A"])
+        flow.flow(score_names=["measure_A"])
 
         assert "measure_A" in flow.best_fits
         assert "measure_B" not in flow.best_fits
@@ -224,7 +224,7 @@ class TestSubsetMeasures:
     def test_fit_quality_columns_match_subset(self):
         """fit_quality should only contain columns for the requested measures."""
         flow = Flow.from_distances_and_scores(distances=DISTANCES, scores=SCORES)
-        flow.flow(measures=["measure_B"])
+        flow.flow(score_names=["measure_B"])
 
         assert list(flow.fit_quality.columns) == ["measure_B"]
 

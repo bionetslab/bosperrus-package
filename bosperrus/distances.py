@@ -7,11 +7,11 @@ __all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_t
            'distance_to_convex_hull', 'distance_to_alpha_shape']
 
 
-def distance_to_rectangular_border(coords):
-    if coords.shape[1] != 2:
+def distance_to_rectangular_border(coordinates):
+    if coordinates.shape[1] != 2:
         raise ValueError("Spatial coordinates must be Nx2.")
-    x = coords[:, 0]
-    y = coords[:, 1]
+    x = coordinates[:, 0]
+    y = coordinates[:, 1]
 
     xmin, xmax = x.min(), x.max()
     ymin, ymax = y.min(), y.max()
@@ -27,32 +27,32 @@ def distance_to_rectangular_border(coords):
     return pd.Series(d_border, name="distance_to_rectangular_border")
 
 
-def distance_to_pointset(coords, pointset):
-    coords = np.asarray(coords, dtype=float)
+def distance_to_pointset(coordinates, pointset):
+    coordinates = np.asarray(coordinates, dtype=float)
     pointset = np.asarray(pointset, dtype=float)
-    
-    if coords.shape[1] != pointset.shape[1]:
-        raise ValueError("Coords and pointset must have the same dimensionality.")
+
+    if coordinates.shape[1] != pointset.shape[1]:
+        raise ValueError("Coordinates and pointset must have the same dimensionality.")
     if len(pointset) == 0:
         raise ValueError("Pointset must contain at least one point.")
 
     tree = cKDTree(pointset)
-    d_min, _ = tree.query(coords, k=1)
+    d_min, _ = tree.query(coordinates, k=1)
     return pd.Series(d_min, name="distance_to_pointset")
 
 
-def distance_to_mask(coords, mask):
-    coords = np.asarray(coords, dtype=float)
-    
+def distance_to_mask(coordinates, mask):
+    coordinates = np.asarray(coordinates, dtype=float)
+
     mask_arr = np.asarray(mask)
-    if mask_arr.ndim != coords.shape[1]:
+    if mask_arr.ndim != coordinates.shape[1]:
         raise ValueError("Mask dimensionality must match coordinate dimensionality.")
 
     inverted = ~mask_arr.astype(bool)
     dmap = distance_transform_edt(inverted)
 
-    rounded = np.round(coords).astype(int)
-    for dim in range(coords.shape[1]):
+    rounded = np.round(coordinates).astype(int)
+    for dim in range(coordinates.shape[1]):
         rounded[:, dim] = np.clip(rounded[:, dim], 0, mask_arr.shape[dim] - 1)
 
     # multi-dimensional indexing
@@ -118,34 +118,34 @@ def _point_to_triangle_distance(points, a, b, c):
     return dist
 
 
-def distance_to_convex_hull(coords):
-    coords = np.asarray(coords, dtype=float)
-    if coords.ndim != 2 or coords.shape[1] not in (2, 3):
+def distance_to_convex_hull(coordinates):
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] not in (2, 3):
         raise ValueError("Spatial coordinates must be Nx2 or Nx3.")
 
-    n_points = coords.shape[0]
+    n_points = coordinates.shape[0]
     if n_points == 0:
         return pd.Series([], dtype=float, name="distance_to_convex_hull")
 
-    if n_points <= coords.shape[1]:
+    if n_points <= coordinates.shape[1]:
         # Not enough points to define a full hull; close-distance to points
         if n_points == 1:
             d_vals = np.zeros(1)
         else:
-            d_vals = distance.cdist(coords, coords, metric="euclidean").min(axis=1)
+            d_vals = distance.cdist(coordinates, coordinates, metric="euclidean").min(axis=1)
         return pd.Series(d_vals, name="distance_to_convex_hull")
 
-    hull = ConvexHull(coords)
+    hull = ConvexHull(coordinates)
     d_min = np.full(n_points, np.inf, dtype=float)
 
     for simplex in hull.simplices:
-        if coords.shape[1] == 2 and simplex.shape[0] == 2:
-            a, b = coords[simplex[0]], coords[simplex[1]]
-            d_seg = _point_to_segment_distance(coords, a, b)
+        if coordinates.shape[1] == 2 and simplex.shape[0] == 2:
+            a, b = coordinates[simplex[0]], coordinates[simplex[1]]
+            d_seg = _point_to_segment_distance(coordinates, a, b)
             d_min = np.minimum(d_min, d_seg)
-        elif coords.shape[1] == 3 and simplex.shape[0] == 3:
-            a, b, c = coords[simplex[0]], coords[simplex[1]], coords[simplex[2]]
-            d_tri = _point_to_triangle_distance(coords, a, b, c)
+        elif coordinates.shape[1] == 3 and simplex.shape[0] == 3:
+            a, b, c = coordinates[simplex[0]], coordinates[simplex[1]], coordinates[simplex[2]]
+            d_tri = _point_to_triangle_distance(coordinates, a, b, c)
             d_min = np.minimum(d_min, d_tri)
         else:
             raise ValueError("Unexpected hull simplex shape.")
@@ -153,7 +153,7 @@ def distance_to_convex_hull(coords):
     return pd.Series(d_min, name="distance_to_convex_hull")
 
 
-def distance_to_alpha_shape(coords, alpha):
+def distance_to_alpha_shape(coordinates, alpha):
     """Compute distance from each point to the boundary of the alpha shape
     (concave hull) of the point cloud.
 
@@ -167,9 +167,9 @@ def distance_to_alpha_shape(coords, alpha):
         The right value is data- and scale-dependent. Recommended workflow::
 
             import alphashape, geopandas as gpd, matplotlib.pyplot as plt
-            shape = alphashape.alphashape(coords, alpha=YOUR_ALPHA)
+            shape = alphashape.alphashape(coordinates, alpha=YOUR_ALPHA)
             gpd.GeoSeries([shape]).boundary.plot()
-            plt.scatter(coords[:, 0], coords[:, 1], s=1)
+            plt.scatter(coordinates[:, 0], coordinates[:, 1], s=1)
             plt.show()
 
         Increase ``alpha`` until the boundary traces the ROI nooks without
@@ -182,7 +182,7 @@ def distance_to_alpha_shape(coords, alpha):
 
     Parameters
     ----------
-    coords : array-like, shape (N, 2)
+    coordinates : array-like, shape (N, 2)
         2-D node coordinates.
     alpha : float
         Concaveness parameter. ``alpha=0`` gives the convex hull limit.
@@ -194,7 +194,7 @@ def distance_to_alpha_shape(coords, alpha):
     pd.Series
         Named ``"distance_to_alpha_shape"``. Distance of each point to the
         nearest point on the alpha shape boundary, in the same units as
-        ``coords``.
+        ``coordinates``.
 
     Raises
     ------
@@ -202,7 +202,7 @@ def distance_to_alpha_shape(coords, alpha):
         If ``alphashape`` is not installed.
         Install with ``pip install alphashape`` or ``pip install bosperrus[alphashape]``.
     ValueError
-        If ``coords`` is not Nx2, has fewer than 3 rows, or the resulting
+        If ``coordinates`` is not Nx2, has fewer than 3 rows, or the resulting
         alpha shape is empty (try a smaller ``alpha``).
 
     Warns
@@ -222,17 +222,17 @@ def distance_to_alpha_shape(coords, alpha):
     import shapely
     from shapely.geometry import MultiPolygon
 
-    coords = np.asarray(coords, dtype=float)
-    if coords.ndim != 2 or coords.shape[1] != 2:
+    coordinates = np.asarray(coordinates, dtype=float)
+    if coordinates.ndim != 2 or coordinates.shape[1] != 2:
         raise ValueError(
             "Spatial coordinates must be Nx2 for distance_to_alpha_shape."
         )
-    if len(coords) < 3:
+    if len(coordinates) < 3:
         raise ValueError(
             "At least 3 points are required to compute an alpha shape."
         )
 
-    shape = alphashape.alphashape(coords, alpha)
+    shape = alphashape.alphashape(coordinates, alpha)
 
     if shape is None or shape.is_empty:
         raise ValueError(
@@ -252,7 +252,7 @@ def distance_to_alpha_shape(coords, alpha):
         )
 
     boundary = shape.boundary
-    point_geoms = shapely.points(coords)
+    point_geoms = shapely.points(coordinates)
     d_vals = shapely.distance(point_geoms, boundary)
 
     return pd.Series(d_vals, name="distance_to_alpha_shape")
