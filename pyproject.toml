@@ -1,6 +1,6 @@
 [project]
 name = "bosperrus"
-version = "0.2.3"
+version = "0.3.0"
 authors = [
   { name="Anna Moeller", email="anna.moeller@fau.de" },
 ]
@@ -23,6 +23,7 @@ dependencies = ["scikit-learn",
 dev = ["pytest"]
 graph = ["graph-tool"] # this will fail, only to document intent
 alphashape = ["alphashape", "shapely"]
+anndata = ["anndata"]
 
 [project.urls]
 Homepage = "https://github.com/bionetslab/bosperrus-package"
