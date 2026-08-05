@@ -5,6 +5,7 @@ from bosperrus.graph_construction import (
     rnn_edges,
     delaunay_edges,
     construct_graph,
+    grid_edges,
 )
 
 
@@ -113,6 +114,87 @@ def test_delaunay_edges_covers_all_nodes(grid_coords):
 
 
 # ---------------------------------------------------------------------------
+# grid_edges tests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def hex_grid_rowcol():
+    """3 rows x offset hex layout, deterministic. Node (1,3) (index 6) has a full
+    complement of 6 neighbors; corner node (0,0) (index 0) has only 2."""
+    row = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2])
+    col = np.array([0, 2, 4, 6, 8, 1, 3, 5, 7, 0, 2, 4, 6, 8])
+    return row, col
+
+
+@pytest.fixture
+def rect_grid_rowcol():
+    """3x3 square grid, deterministic. Center node (1,1) (index 4) has 4 neighbors;
+    corner node (0,0) (index 0) has only 2."""
+    rows, cols = np.meshgrid(np.arange(3), np.arange(3), indexing="ij")
+    return rows.ravel(), cols.ravel()
+
+
+def test_grid_edges_returns_frozensets(hex_grid_rowcol):
+    row, col = hex_grid_rowcol
+    edges = grid_edges(row, col, grid_type="hex")
+    assert isinstance(edges, set)
+    assert len(edges) > 0
+    for edge in edges:
+        assert isinstance(edge, frozenset), f"Expected frozenset, got {type(edge)}"
+
+
+def test_grid_edges_hex_interior_node_has_six_neighbors(hex_grid_rowcol):
+    row, col = hex_grid_rowcol
+    edges = grid_edges(row, col, grid_type="hex")
+    degree = {i: 0 for i in range(len(row))}
+    for u, v in (tuple(e) for e in edges):
+        degree[u] += 1
+        degree[v] += 1
+    assert degree[6] == 6, f"Interior node (1,3) expected 6 neighbors, got {degree[6]}"
+
+
+def test_grid_edges_hex_corner_node_has_fewer_neighbors(hex_grid_rowcol):
+    row, col = hex_grid_rowcol
+    edges = grid_edges(row, col, grid_type="hex")
+    degree = {i: 0 for i in range(len(row))}
+    for u, v in (tuple(e) for e in edges):
+        degree[u] += 1
+        degree[v] += 1
+    assert degree[0] == 2, f"Corner node (0,0) expected 2 neighbors, got {degree[0]}"
+
+
+def test_grid_edges_rect_interior_node_has_four_neighbors(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    edges = grid_edges(row, col, grid_type="rect")
+    degree = {i: 0 for i in range(len(row))}
+    for u, v in (tuple(e) for e in edges):
+        degree[u] += 1
+        degree[v] += 1
+    assert degree[4] == 4, f"Center node (1,1) expected 4 neighbors, got {degree[4]}"
+
+
+def test_grid_edges_rect_corner_node_has_fewer_neighbors(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    edges = grid_edges(row, col, grid_type="rect")
+    degree = {i: 0 for i in range(len(row))}
+    for u, v in (tuple(e) for e in edges):
+        degree[u] += 1
+        degree[v] += 1
+    assert degree[0] == 2, f"Corner node (0,0) expected 2 neighbors, got {degree[0]}"
+
+
+def test_grid_edges_invalid_grid_type(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    with pytest.raises(ValueError, match="Unknown grid_type"):
+        grid_edges(row, col, grid_type="invalid")
+
+
+def test_grid_edges_mismatched_length_raises():
+    with pytest.raises(ValueError, match="same length"):
+        grid_edges(np.array([0, 1, 2]), np.array([0, 1]), grid_type="rect")
+
+
+# ---------------------------------------------------------------------------
 # construct_graph dispatch tests
 # ---------------------------------------------------------------------------
 
@@ -137,3 +219,17 @@ def test_construct_graph_dispatches_delaunay(grid_coords):
 def test_construct_graph_invalid_type(grid_coords):
     with pytest.raises(ValueError, match="Unknown graph type"):
         construct_graph(grid_coords, "invalid")
+
+
+def test_construct_graph_dispatches_grid(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    # "grid" construction never touches `coordinates` (row/col are the actual input),
+    # so passing None here is deliberate, not an oversight.
+    result = construct_graph(None, "grid", row=row, col=col, grid_type="rect")
+    expected = grid_edges(row, col, grid_type="rect")
+    assert result == expected
+
+
+def test_construct_graph_grid_requires_row_and_col(grid_coords):
+    with pytest.raises(ValueError, match="'row' and 'col' must be provided"):
+        construct_graph(grid_coords, "grid")
