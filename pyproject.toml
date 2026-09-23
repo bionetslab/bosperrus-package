@@ -24,6 +24,7 @@ dev = ["pytest"]
 graph = ["graph-tool"] # this will fail, only to document intent
 alphashape = ["alphashape", "shapely"]
 anndata = ["anndata"]
+image-masks = ["scikit-image", "anndata"]
 
 [project.urls]
 Homepage = "https://github.com/bionetslab/bosperrus-package"
