@@ -7,7 +7,9 @@ from bosperrus.distances import (
     distance_to_pointset,
     distance_to_mask,
     distance_to_alpha_shape,
+    distance_to_grid_border,
 )
+from bosperrus.graph_construction import split_into_connected_components
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +174,92 @@ def test_distance_to_mask_2d():
     assert d_far_outside.min() > d_near_outside.max(), (
         "Pixels far from the foreground block should have larger distance than nearby ones"
     )
+
+
+def test_distance_to_mask_pixel_size_um_scales_distance():
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[5:15, 5:15] = True
+    coords = np.array([[0.0, 0.0], [17.0, 17.0]])
+
+    d_px = distance_to_mask(coords, mask)
+    d_um = distance_to_mask(coords, mask, pixel_size_um=0.5)
+    np.testing.assert_allclose(d_um.to_numpy(), d_px.to_numpy() * 0.5)
+
+
+def test_distance_to_mask_default_pixel_size_is_unscaled():
+    mask = np.zeros((20, 20), dtype=bool)
+    mask[5:15, 5:15] = True
+    coords = np.array([[0.0, 0.0], [17.0, 17.0]])
+
+    d_default = distance_to_mask(coords, mask)
+    d_explicit = distance_to_mask(coords, mask, pixel_size_um=1.0)
+    np.testing.assert_allclose(d_default.to_numpy(), d_explicit.to_numpy())
+
+
+# ---------------------------------------------------------------------------
+# distance_to_grid_border
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def rect_block_rowcol():
+    """3x3 square grid, deterministic. Center node (1,1) (index 4) is one
+    grid step from the nearest border node; corner node (0,0) (index 0) is
+    itself a border node."""
+    rows, cols = np.meshgrid(np.arange(3), np.arange(3), indexing="ij")
+    return rows.ravel(), cols.ravel()
+
+
+def test_distance_to_grid_border_returns_series(rect_block_rowcol):
+    row, col = rect_block_rowcol
+    d = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect")
+    assert isinstance(d, pd.Series)
+    assert d.name == "distance_to_grid_border"
+    assert len(d) == 9
+
+
+def test_distance_to_grid_border_corner_is_zero_center_is_positive(rect_block_rowcol):
+    row, col = rect_block_rowcol
+    d = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect")
+    assert d.iloc[0] == pytest.approx(0.0)
+    assert d.iloc[4] > 0.0
+
+
+def test_distance_to_grid_border_scales_linearly_with_bin_size_um(rect_block_rowcol):
+    row, col = rect_block_rowcol
+    d_1 = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect")
+    d_2_5 = distance_to_grid_border(row, col, bin_size_um=2.5, grid_type="rect")
+    np.testing.assert_allclose(d_2_5.to_numpy(), d_1.to_numpy() * 2.5)
+
+
+def test_distance_to_grid_border_does_not_cross_disconnected_components():
+    """Two disconnected 3x3 blocks, offset by a 100-step gap on the row axis.
+    A pooled (non-per-component) distance computation could measure a false
+    'close' distance across that gap; per-component computation must not."""
+    rows_a, cols_a = np.meshgrid(np.arange(3), np.arange(3), indexing="ij")
+    rows_b, cols_b = np.meshgrid(np.arange(3), np.arange(3), indexing="ij")
+    row = np.concatenate([rows_a.ravel(), rows_b.ravel() + 100])
+    col = np.concatenate([cols_a.ravel(), cols_b.ravel()])
+
+    d = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect")
+    # max possible distance-to-border within one isolated 3x3 block is small
+    # (sqrt(2)); anything reflecting the 100-step gap would dwarf that.
+    assert d.max() < 2.0
+
+
+def test_distance_to_grid_border_n_counts_excludes_zero_count_nodes(rect_block_rowcol):
+    row, col = rect_block_rowcol
+    n_counts = np.ones(9)
+    n_counts[4] = 0  # zero out the center
+    d = distance_to_grid_border(row, col, bin_size_um=1.0, n_counts=n_counts, grid_type="rect")
+    assert np.isnan(d.iloc[4])
+
+
+def test_distance_to_grid_border_reuses_precomputed_component_labels(rect_block_rowcol):
+    row, col = rect_block_rowcol
+    labels = split_into_connected_components(row, col, grid_type="rect")
+    d_reused = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect", component_labels=labels)
+    d_computed = distance_to_grid_border(row, col, bin_size_um=1.0, grid_type="rect")
+    np.testing.assert_allclose(d_reused.to_numpy(), d_computed.to_numpy())
 
 
 # ---------------------------------------------------------------------------

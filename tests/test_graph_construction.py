@@ -6,6 +6,8 @@ from bosperrus.graph_construction import (
     delaunay_edges,
     construct_graph,
     grid_edges,
+    split_into_connected_components,
+    find_grid_border,
 )
 
 
@@ -233,3 +235,99 @@ def test_construct_graph_dispatches_grid(rect_grid_rowcol):
 def test_construct_graph_grid_requires_row_and_col(grid_coords):
     with pytest.raises(ValueError, match="'row' and 'col' must be provided"):
         construct_graph(grid_coords, "grid")
+
+
+# ---------------------------------------------------------------------------
+# split_into_connected_components
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def line_grid_with_gap():
+    """5 nodes in a row (row=0, col=0..4); n_counts=0 at col=2 splits it
+    into two components of 2 once excluded."""
+    row = np.zeros(5, dtype=int)
+    col = np.arange(5)
+    n_counts = np.array([5, 5, 0, 5, 5])
+    return row, col, n_counts
+
+
+def test_split_into_connected_components_single_block_is_one_component(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    labels = split_into_connected_components(row, col, grid_type="rect")
+    assert (labels == 0).all()
+
+
+def test_split_into_connected_components_without_n_counts_is_one_component(line_grid_with_gap):
+    row, col, _ = line_grid_with_gap
+    labels = split_into_connected_components(row, col, grid_type="rect")
+    assert (labels == 0).all()
+
+
+def test_split_into_connected_components_n_counts_filters_zero_and_splits(line_grid_with_gap):
+    row, col, n_counts = line_grid_with_gap
+    labels = split_into_connected_components(row, col, n_counts=n_counts, grid_type="rect")
+    assert labels[2] == -1  # zero-count node always excluded
+    assert labels[0] == labels[1]
+    assert labels[3] == labels[4]
+    assert labels[0] != labels[3]
+    assert set(labels.tolist()) == {-1, 0, 1}
+
+
+def test_split_into_connected_components_min_size_drops_small(line_grid_with_gap):
+    row, col, n_counts = line_grid_with_gap
+    labels = split_into_connected_components(row, col, n_counts=n_counts, grid_type="rect", min_size=2)
+    # both surviving pieces have exactly 2 members, <= min_size=2 -> all dropped
+    assert (labels == -1).all()
+
+
+def test_split_into_connected_components_mismatched_length_raises():
+    with pytest.raises(ValueError, match="same length"):
+        split_into_connected_components(np.array([0, 1, 2]), np.array([0, 1]))
+
+
+def test_split_into_connected_components_n_counts_mismatched_length_raises(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    with pytest.raises(ValueError, match="n_counts must have the same length"):
+        split_into_connected_components(row, col, n_counts=np.ones(3))
+
+
+# ---------------------------------------------------------------------------
+# find_grid_border
+# ---------------------------------------------------------------------------
+
+def test_find_grid_border_rect_corner_is_border_center_is_not(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    is_border = find_grid_border(row, col, grid_type="rect")
+    assert is_border[0]        # corner, degree 2 < 4
+    assert not is_border[4]    # center, degree 4
+
+
+def test_find_grid_border_hex_corner_is_border_interior_is_not(hex_grid_rowcol):
+    row, col = hex_grid_rowcol
+    is_border = find_grid_border(row, col, grid_type="hex")
+    assert is_border[0]      # corner, degree 2 < 6
+    assert not is_border[6]  # interior, degree 6
+
+
+def test_find_grid_border_n_counts_excludes_zero_count_and_updates_neighbor_degree(rect_grid_rowcol):
+    """Zeroing one of the center's 4 neighbors should exclude that neighbor
+    (always False) and drop the center's real degree to 3, making it a
+    border node even though its raw grid degree is still 4."""
+    row, col = rect_grid_rowcol
+    n_counts = np.ones(9)
+    n_counts[1] = 0  # node (0,1), one of the center (1,1)'s neighbors
+
+    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type="rect")
+    assert not is_border[1]   # excluded node is always False
+    assert is_border[4]       # center now has only 3 real neighbors
+
+
+def test_find_grid_border_invalid_grid_type(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    with pytest.raises(ValueError, match="Unknown grid_type"):
+        find_grid_border(row, col, grid_type="invalid")
+
+
+def test_find_grid_border_mismatched_length_raises():
+    with pytest.raises(ValueError, match="same length"):
+        find_grid_border(np.array([0, 1, 2]), np.array([0, 1]))
