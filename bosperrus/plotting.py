@@ -7,7 +7,28 @@ would just be friction for the common case.
 """
 import numpy as np
 
-__all__ = ["plot_fit"]
+from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
+
+__all__ = ["plot_fit", "FIT_PALETTE"]
+
+# Name -> color, one entry per built-in Fit subclass, for code that only has
+# the serialized best_fit_type string (e.g. anndata_api.py's
+# plot_border_effect/plot_diffusion, reconstructing a predictor from
+# adata.uns-stored params rather than a live Fit instance -- see
+# _predict_from_params). Each subclass's `color` class attribute (e.g.
+# `ExponentialSaturationFit.color`) is the actual source of truth; this dict
+# is just a name-keyed view over those, built here so it can never drift out
+# of sync with them. Code holding a live Fit instance should just read
+# `fit.color` directly instead of going through this dict.
+FIT_PALETTE = {
+    name: cls.color
+    for cls, name in [
+        (ConstantFit, "Constant Fit"),
+        (PiecewiseLinearFit, "Piecewise Linear Fit"),
+        (ExponentialSaturationFit, "Exponential Saturation Fit"),
+        (MichaelisMentenFit, "Michaelis-Menten Fit"),
+    ]
+}
 
 
 def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=40,

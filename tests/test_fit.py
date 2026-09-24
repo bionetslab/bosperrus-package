@@ -16,6 +16,7 @@ import pandas as pd
 import pytest
 
 from bosperrus.fit import (
+    Fit,
     ConstantFit,
     PiecewiseLinearFit,
     ExponentialSaturationFit,
@@ -443,6 +444,24 @@ class TestMichaelisMentenFit:
 # ============================================================
 
 class TestCrossModel:
+
+    def test_each_subclass_has_its_own_color(self):
+        """color is a class attribute, readable without instantiating, and
+        distinct per subclass -- the whole point is that a live Fit
+        instance (fit.color) or the bare class (ConstantFit.color) both
+        expose it directly, no separate lookup table needed."""
+        classes = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]
+        for cls in classes:
+            assert cls.color != Fit.color  # every concrete subclass overrides the base default
+        colors = [cls.color for cls in classes]
+        assert len(set(colors)) == len(colors)  # all distinct
+
+    def test_instance_color_matches_class_color(self):
+        C = make_series(np.ones(N))
+        d = make_series(D)
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+            f = cls(C, d)
+            assert f.color == cls.color
 
     def test_constant_data_favors_constant_fit(self):
         C = make_series(np.full(N, 3.0))

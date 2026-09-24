@@ -3,8 +3,20 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bosperrus.fit import ExponentialSaturationFit
-from bosperrus.plotting import plot_fit
+from bosperrus.fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
+from bosperrus.plotting import plot_fit, FIT_PALETTE
+
+
+def test_fit_palette_matches_each_subclasss_own_color():
+    """FIT_PALETTE is derived from each subclass's own `color` class
+    attribute -- must never drift out of sync with it."""
+    expected = {
+        "Constant Fit": ConstantFit.color,
+        "Piecewise Linear Fit": PiecewiseLinearFit.color,
+        "Exponential Saturation Fit": ExponentialSaturationFit.color,
+        "Michaelis-Menten Fit": MichaelisMentenFit.color,
+    }
+    assert FIT_PALETTE == expected
 
 
 def test_plot_fit_draws_curve_matching_predict_fn():

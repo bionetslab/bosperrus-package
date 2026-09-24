@@ -131,7 +131,7 @@ Tests live in `tests/test_fit.py` and cover all four `Fit` subclasses plus cross
 
 1. Subclass `Fit` in `fit.py`.
 2. Implement `fit()`, `correct()`, `predict(d)`, `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`.
-3. Set `self._name` in `__init__`.
+3. Set `self._name` in `__init__`; set `color = "#hexvalue"` as a class attribute (not in `__init__`) -- if you skip this, `Fit`'s own `color = "C1"` default applies, and `plotting.FIT_PALETTE` (derived from each subclass's `color`) falls back to `plot_fit`'s own default too.
 4. Name param dict keys as `{snake_case_model_name}_{param}` (e.g. `my_model_a`).
 5. Add to the default `fits` list in `Flow.flow()` if it should run by default.
 6. Add a `TestMyModelFit` class in `tests/test_fit.py` mirroring the existing test structure.

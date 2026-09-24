@@ -9,6 +9,15 @@ _DEFAULT_CONVERGENCE_THRESHOLD = 0.95
 __all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'MichaelisMentenFit']
 
 class Fit():
+    color = "C1"
+    """Canonical display color for this model type (a class attribute, so
+    it's readable without instantiating, e.g. `ConstantFit.color`, and every
+    instance exposes it directly, e.g. `fit.color` -- no separate lookup
+    table needed). Subclasses override this with their own hex value;
+    `"C1"` here is just the fallback for a Fit subclass that doesn't bother
+    setting one. `plotting.FIT_PALETTE` is built from these, not the other
+    way around -- this is the single source of truth."""
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Base class for all curve-fitting models applied to S_true as a function of d.
@@ -272,6 +281,8 @@ class Fit():
 
 
 class ConstantFit(Fit):
+    color = "#24592F"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series = None):
         """
         Fits a horizontal constant (the mean of S_true) as the null/baseline model.
@@ -333,6 +344,8 @@ class ConstantFit(Fit):
 
 
 class PiecewiseLinearFit(Fit):
+    color = "#0033FF"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits a piecewise linear model with a plateau: S(d) = m*d + c for d <= b,
@@ -468,6 +481,8 @@ class PiecewiseLinearFit(Fit):
 
 
 class ExponentialSaturationFit(Fit):
+    color = "#AB0C67"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits an exponential saturation model: S(d) = a*(1 - exp(-b*d)) + c,
@@ -572,6 +587,8 @@ class ExponentialSaturationFit(Fit):
 
 
 class MichaelisMentenFit(Fit):
+    color = "#FFCC00"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits a Michaelis-Menten (hyperbolic saturation) model: S(d) = a*d/(b+d) + c,

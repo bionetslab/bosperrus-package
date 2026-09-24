@@ -20,7 +20,7 @@ from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, Mich
 from .graph_construction import split_into_connected_components, find_grid_border, grid_edges
 from .image_masks import get_tissue_mask
 from .pipeline import Flow
-from .plotting import plot_fit
+from .plotting import plot_fit, FIT_PALETTE
 
 __all__ = [
     "identify_analysis_buffer", "correct_layer", "quantify_diffusion",
@@ -627,7 +627,16 @@ def _plot_per_component_fit(score_values, distance, components, per_component, x
         info = per_component[label]
         member_mask = components == label
         predict_fn = _predict_from_params(info["best_fit_type"], info["params"])
-        plot_fit(ax, distance[member_mask], score_values[member_mask], predict_fn, **plot_fit_kwargs)
+
+        # Color the fitted curve by model type (FIT_PALETTE), same convention
+        # every other bosperrus plot uses -- unless the caller already asked
+        # for a specific color via their own line_kwargs.
+        kwargs = dict(plot_fit_kwargs)
+        line_kwargs = dict(kwargs.pop("line_kwargs", {}))
+        line_kwargs.setdefault("color", FIT_PALETTE.get(info["best_fit_type"], "C1"))
+        kwargs["line_kwargs"] = line_kwargs
+
+        plot_fit(ax, distance[member_mask], score_values[member_mask], predict_fn, **kwargs)
         ax.set_xlabel(xlabel)
         ax.set_title(f"component {label} (n={info['n_spots']}, {info['best_fit_type']})", fontsize=9)
 
