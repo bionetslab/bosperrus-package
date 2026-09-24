@@ -493,7 +493,7 @@ def quantify_diffusion(
     _require_anndata()
     adata = adata.copy() if copy else adata
 
-    row, col, n_counts, components = _get_components(
+    row, col, _, components = _get_components(
         adata, row_key, col_key, grid_type, n_counts_key, min_component_size, components_key, stacklevel=3,
     )
 
