@@ -6,6 +6,8 @@ functions below, via `_require_anndata()` -- so the rest of `bosperrus` (and thi
 module's own presence in `bosperrus.__all__`) stays importable without it installed,
 mirroring `distances.distance_to_alpha_shape`'s optional-dependency pattern.
 """
+import warnings
+
 import numpy as np
 import pandas as pd
 
@@ -15,6 +17,12 @@ from .graph_construction import split_into_connected_components, find_grid_borde
 from .pipeline import Flow
 
 __all__ = ["identify_analysis_buffer", "correct_layer"]
+
+# Below this average component size (kept spots / number of components),
+# warn that components look unreasonably numerous -- usually a sign of
+# grid_type mismatch, a bad components_key override, or otherwise
+# over-fragmented data that per-component fits won't handle reliably.
+_MIN_REASONABLE_AVG_COMPONENT_SIZE = 20
 
 
 def _require_anndata():
@@ -41,7 +49,10 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
     components, or reuse distances computed by an earlier call); otherwise
     it's computed here and written to adata.obs under that same key, so every
     intermediate value ends up visible/reusable, not just the final outputs.
-    Pass None to skip persisting a value that wasn't already present.
+    Pass None to skip persisting a value that wasn't already present. A
+    reused column is sanity-checked (components must cast to int; distance
+    must be numeric and non-negative) so a bad override fails clearly here,
+    not confusingly later inside the fitting loop.
 
     is_border is masked to False wherever components < 0 (n_counts <= 0, or
     a component dropped by min_component_size), matching the same
@@ -53,7 +64,13 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
     n_counts = adata.obs[n_counts_key].to_numpy() if n_counts_key is not None else None
 
     if components_key is not None and components_key in adata.obs:
-        components = adata.obs[components_key].to_numpy().astype(int)
+        try:
+            components = adata.obs[components_key].to_numpy().astype(int)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"components_key={components_key!r} column isn't usable as integer "
+                f"component labels: {e}"
+            ) from e
     else:
         components = split_into_connected_components(
             row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
@@ -65,6 +82,15 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
 
     if distance_key is not None and distance_key in adata.obs:
         distance = adata.obs[distance_key].to_numpy()
+        if not np.issubdtype(distance.dtype, np.number):
+            raise ValueError(
+                f"distance_key={distance_key!r} column must be numeric, got dtype {distance.dtype}."
+            )
+        finite = np.isfinite(distance)
+        if finite.any() and (distance[finite] < 0).any():
+            raise ValueError(
+                f"distance_key={distance_key!r} column contains negative values -- distances must be >= 0."
+            )
     else:
         distance = distance_to_grid_border(
             row, col, bin_size_um=bin_size_um, n_counts=n_counts,
@@ -73,11 +99,27 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
         if distance_key is not None:
             adata.obs[distance_key] = distance
 
-    if not (components >= 0).any():
+    n_kept = int((components >= 0).sum())
+    if n_kept == 0:
         raise ValueError(
-            "No connected components survived n_counts/min_component_size filtering -- "
-            "nothing to fit. Check row_key/col_key/n_counts_key/grid_type/min_component_size."
+            "No connected components available for fitting -- either none survived "
+            "n_counts/min_component_size filtering, or components_key is all-excluded. "
+            "Check row_key/col_key/n_counts_key/grid_type/min_component_size/components_key."
         )
+
+    n_components = len(np.unique(components[components >= 0]))
+    if n_kept / n_components < _MIN_REASONABLE_AVG_COMPONENT_SIZE:
+        warnings.warn(
+            f"{n_components} components for {n_kept} kept spots (average size "
+            f"{n_kept / n_components:.1f}) -- unusually fragmented. This can mean a "
+            f"grid_type mismatch, a components_key column that isn't really component "
+            f"labels, or genuinely many small/noisy fragments; per-component fits on "
+            f"very small components are unreliable. Check grid_type/components_key, or "
+            f"raise min_component_size to drop the smallest fragments.",
+            UserWarning,
+            stacklevel=3,
+        )
+
     return components, distance, is_border
 
 

@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -196,6 +198,60 @@ def test_identify_analysis_buffer_components_key_reuses_existing_column():
     per_component = adata.uns["analysis_buffer_fit"]["per_component"]
     assert set(per_component) == {0, 1}
     np.testing.assert_array_equal(adata.obs["my_components"].to_numpy(), fake_components)
+
+
+def test_identify_analysis_buffer_non_numeric_components_key_raises_clear_error():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_components"] = [f"core_{i}" for i in range(len(row))]
+
+    with pytest.raises(ValueError, match="isn't usable as integer component labels"):
+        identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+
+
+def test_identify_analysis_buffer_non_numeric_distance_key_raises_clear_error():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_distance"] = [f"far_{i}" for i in range(len(row))]
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_distance")
+
+
+def test_identify_analysis_buffer_negative_distance_key_raises_clear_error():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    fake_distance = RNG.uniform(0, 5, size=len(row))
+    fake_distance[0] = -1.0
+    adata.obs["my_distance"] = fake_distance
+
+    with pytest.raises(ValueError, match="contains negative values"):
+        identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_distance")
+
+
+def test_identify_analysis_buffer_warns_on_unreasonably_many_components():
+    """A components_key that's really just per-spot noise (unique label per
+    spot) should trigger the over-fragmentation warning."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_components"] = np.arange(len(row))  # every spot its own "component"
+
+    with pytest.warns(UserWarning, match="unusually fragmented"):
+        identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+
+
+def test_identify_analysis_buffer_no_warning_for_reasonable_component_count():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # any warning fails the test
+        identify_analysis_buffer(adata, score="score", grid_type="rect")
 
 
 def test_identify_analysis_buffer_n_counts_key_excludes_zero_count_spots():
