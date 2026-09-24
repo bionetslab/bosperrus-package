@@ -6,6 +6,7 @@ an extra, since it's common/light enough that gating it behind an extra
 would just be friction for the common case.
 """
 import numpy as np
+from matplotlib.colors import LogNorm
 
 from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
 
@@ -60,6 +61,12 @@ def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=40,
         Passed to `ax.hist2d`.
     hist_kwargs : dict, optional
         Extra keyword arguments forwarded to `ax.hist2d` (e.g. `cmap`).
+        Defaults to a log-scale color norm (`LogNorm()`) -- bin counts in a
+        score-vs-distance histogram are typically heavily right-skewed (a
+        few dense bins, many sparse ones), so a linear norm crushes
+        everything but the densest bins down near the colormap's low end.
+        Pass `hist_kwargs={"norm": None}` (or any other `Normalize`) to
+        override.
     line_kwargs : dict, optional
         Extra keyword arguments forwarded to `ax.plot` for the fitted curve
         (e.g. `color`, `linewidth`).
@@ -80,6 +87,7 @@ def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=40,
 
     hist_kwargs = dict(hist_kwargs or {})
     hist_kwargs.setdefault("cmap", "Greys")
+    hist_kwargs.setdefault("norm", LogNorm())
     ax.hist2d(distance, score, bins=bins, **hist_kwargs)
 
     if d_grid is None:
