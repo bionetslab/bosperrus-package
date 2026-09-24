@@ -80,6 +80,7 @@ All fit models subclass `Fit`. The base class:
 | `ConstantFit` | `c` (mean; null/baseline model) | `constant_c` |
 | `PiecewiseLinearFit` | `m*d + c` for `d ≤ b`, plateau at `m*b + c` for `d > b` | `piecewise_linear_b`, `piecewise_linear_m`, `piecewise_linear_c` |
 | `ExponentialSaturationFit` | `a*(1 - exp(-b*d)) + c`, `b > 0` | `exponential_saturation_a`, `exponential_saturation_b`, `exponential_saturation_c` |
+| `ExponentialDecayFit` | `a*exp(-b*d)`, `b > 0` (no offset -- asymptotes to exactly 0) | `exponential_decay_a`, `exponential_decay_b` |
 | `MichaelisMentenFit` | `a*d/(b+d) + c`, `b > 0` (Km = `b`) | `michaelis_menten_a`, `michaelis_menten_b`, `michaelis_menten_c` |
 
 **Correction formula**: all saturation models shift raw values to the asymptote: `S_corrected = S_true + (asymptote - S_model)`. If fitting fails (`_converged = False`), `S_corrected = S_true` (passthrough).

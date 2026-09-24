@@ -6,7 +6,7 @@ from .evaluate_fit import log_likelihood, akaike_information_criterion
 _EPS = 1e-10
 _DEFAULT_CONVERGENCE_THRESHOLD = 0.95
 
-__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'MichaelisMentenFit']
+__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'ExponentialDecayFit', 'MichaelisMentenFit']
 
 class Fit():
     color = "C1"
@@ -584,6 +584,122 @@ class ExponentialSaturationFit(Fit):
             d, self._params["exponential_saturation_a"], self._params["exponential_saturation_b"],
             self._params["exponential_saturation_c"],
         )
+
+
+class ExponentialDecayFit(Fit):
+    color = "#7B2CBF"
+
+    def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
+        """
+        Fits a pure exponential decay model: S(d) = a * exp(-b*d), which
+        asymptotes to exactly 0 as d -> infinity -- unlike
+        ExponentialSaturationFit, there is no free offset term for the
+        far-field value. Appropriate only when the far-field value is
+        actually known/expected to be zero rather than an unknown constant
+        to be estimated (e.g. fitting counts strictly outside a tissue mask,
+        restricted to a connected, n_counts>0 component -- there, the region
+        being fit is bounded exactly by where the signal already hits zero,
+        by construction of how the component was built, so forcing that
+        boundary condition is a correct constraint, not an assumption).
+
+        Parameters a, b represent amplitude (at d=0) and rate respectively.
+        b is constrained to be positive (monotonic decay, not growth).
+
+        A node is considered converged once it has decayed to within
+        `threshold` of the way from a to 0, i.e. when d >= -ln(1 - threshold) / b
+        -- the same time-constant relationship as ExponentialSaturationFit,
+        since it depends only on b, not on the (here fixed at 0) asymptote.
+
+        Parameters
+        ----------
+        S_true : pd.DataFrame | pd.Series
+            Observed signal values.
+        d : pd.DataFrame | pd.Series
+            Distance from border, aligned with S_true.
+        """
+        super().__init__(S_true, d)
+        self._name = "Exponential Decay Fit"
+
+    @staticmethod
+    def exp_decay(d, a, b):
+        return a * np.exp(-b * d)
+
+    def _fit_exponential_decay(self):
+        a0 = self._S_true.iloc[np.argmin(self._d)] if hasattr(self._S_true, "iloc") else self._S_true[np.argmin(self._d)]
+        p0 = [a0, 1 / (np.mean(self._d) + 1e-6)]
+        bounds = ([-np.inf, 1e-6], [np.inf, np.inf])
+        popt, _ = curve_fit(self.exp_decay, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
+        a_opt, b_opt = popt
+        C_fit = self.exp_decay(self._d, a_opt, b_opt)
+        return a_opt, b_opt, C_fit
+
+    def _rate_observed_metrics(self):
+        if not self._converged:
+            self._observed_effect_strength = np.nan
+            self._observed_half_life = np.nan
+            return
+        d_min = np.min(self._d)
+        d_max = np.max(self._d)
+        a, b = self.params["exponential_decay_a"], self.params["exponential_decay_b"]
+        c_border = self.exp_decay(d_min, a, b)
+        c_center = self.exp_decay(d_max, a, b)
+
+        self._observed_effect_strength = (c_border - c_center) / (c_border + c_center + _EPS)
+
+        C_mid = (c_border + c_center) / 2
+        raw_half_life = -(1 / b) * np.log(C_mid / (a + _EPS) + _EPS)
+        self._observed_half_life = raw_half_life / (d_max + _EPS)
+
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
+        """
+        The exponential decay a*exp(-b*d) asymptotes to 0. A point is
+        considered converged once it has decayed to within `threshold` of
+        the way from a to 0, i.e. when:
+
+            a - a*exp(-b*d) >= threshold * a
+            => d >= -ln(1 - threshold) / b
+
+        Returns the fraction of observed nodes below this convergence distance.
+        """
+        if self.params is None:
+            raise ValueError("Model has not been fitted yet")
+        if not self._converged:
+            self._fraction_not_converged = np.nan
+            return self._fraction_not_converged
+        if not (0 < threshold < 1):
+            raise ValueError("threshold must be in (0, 1)")
+        b = self.params["exponential_decay_b"]
+        d_converge = -np.log(1 - threshold) / b
+        self._fraction_not_converged = float(np.mean(self._d < d_converge))
+        return self._fraction_not_converged
+
+    def fit(self):
+        try:
+            a_opt, b_opt, C_fit = self._fit_exponential_decay()
+            self._params = {"exponential_decay_a": a_opt, "exponential_decay_b": b_opt}
+            self._S_model = C_fit
+            self._converged = True
+        except (RuntimeError, ValueError):
+            self._converged = False
+            self._params = {"exponential_decay_a": np.nan, "exponential_decay_b": np.nan}
+            self._S_model = self._S_true
+
+        self._finalize_fit()
+
+    def correct(self):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before correct()")
+        if self._converged:
+            # asymptote is 0, so "S_true + asymptote - S_model" simplifies to S_true - S_model
+            self._S_corrected = self._S_true - self.S_model
+        else:
+            self._S_corrected = self._S_true
+        return self.S_corrected
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.exp_decay(d, self._params["exponential_decay_a"], self._params["exponential_decay_b"])
 
 
 class MichaelisMentenFit(Fit):

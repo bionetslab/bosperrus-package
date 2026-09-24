@@ -8,7 +8,7 @@ would just be friction for the common case.
 import numpy as np
 from matplotlib.colors import LogNorm
 
-from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
+from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 
 __all__ = ["plot_fit", "FIT_PALETTE"]
 
@@ -27,6 +27,7 @@ FIT_PALETTE = {
         (ConstantFit, "Constant Fit"),
         (PiecewiseLinearFit, "Piecewise Linear Fit"),
         (ExponentialSaturationFit, "Exponential Saturation Fit"),
+        (ExponentialDecayFit, "Exponential Decay Fit"),
         (MichaelisMentenFit, "Michaelis-Menten Fit"),
     ]
 }

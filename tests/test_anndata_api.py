@@ -10,7 +10,7 @@ anndata = pytest.importorskip("anndata", reason="anndata not installed")
 from bosperrus.anndata_api import (
     identify_analysis_buffer, correct_layer, quantify_diffusion, plot_border_effect, plot_diffusion,
 )
-from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit
+from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit
 
 
 
@@ -544,6 +544,45 @@ def test_quantify_diffusion_mask_distance_key_overrides_computed_distance():
     fit_info = adata.uns["diffusion_fit"]["per_component"][0]
     assert fit_info["best_fit_type"] == "Exponential Saturation Fit"
     assert fit_info["alpha"] == pytest.approx(-a_true / bin_size_um**2, rel=0.2)
+    assert fit_info["beta"] == pytest.approx(b_true, rel=0.3)
+
+
+def test_quantify_diffusion_picks_exponential_decay_when_floor_is_zero():
+    """When the true far-field value genuinely is 0 (no c offset),
+    ExponentialDecayFit's one-fewer-parameter should win over
+    ExponentialSaturationFit on AIC -- and alpha should come out positive
+    directly from its `a` (no sign flip needed, unlike ExponentialSaturationFit's).
+
+    Needs low noise AND a modest n to be decisive: log_likelihood is
+    -0.5*n*log(sigma2), so at large n (e.g. 900 spots) even a tiny relative
+    SSE reduction from ExponentialSaturationFit's extra, nearly-redundant c
+    (its curve_fit still finds a+c very close to 0, i.e. essentially the
+    same curve as ExponentialDecayFit -- but "nearly the same" still isn't
+    "exactly the same" on any single finite noisy sample) gets amplified
+    into a real AIC edge that overcomes the fixed 2-unit parameter-count
+    penalty, regardless of how low the noise is -- an honest, expected
+    large-N property of AIC here, not a bug, and not something a smaller
+    per-component sample (typical for this kind of per-component fit) runs
+    into: confirmed empirically, decay wins reliably once n <~ 225."""
+    RNG = np.random.default_rng(42)
+    n_side = 15
+    adata, row, col = _rect_grid_adata(n_side)
+    fake_distance = RNG.uniform(0, 20, size=len(row))
+    adata.obs["my_mask_distance"] = fake_distance
+
+    a_true, b_true = 4.0, 0.5
+    signal = ExponentialDecayFit.exp_decay(fake_distance, a_true, b_true)
+    adata.obs["n_counts"] = signal + RNG.normal(0, 0.001, size=len(row))
+
+    bin_size_um = 8.0
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect",
+        bin_size_um=bin_size_um, mask_distance_key="my_mask_distance",
+    )
+
+    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
+    assert fit_info["best_fit_type"] == "Exponential Decay Fit"
+    assert fit_info["alpha"] == pytest.approx(a_true / bin_size_um**2, rel=0.2)
     assert fit_info["beta"] == pytest.approx(b_true, rel=0.3)
 
 

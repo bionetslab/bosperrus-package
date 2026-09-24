@@ -4,7 +4,9 @@ import pandas as pd
 import pytest
 from matplotlib.colors import LogNorm, Normalize
 
-from bosperrus.fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
+from bosperrus.fit import (
+    ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit,
+)
 from bosperrus.plotting import plot_fit, FIT_PALETTE
 
 
@@ -15,6 +17,7 @@ def test_fit_palette_matches_each_subclasss_own_color():
         "Constant Fit": ConstantFit.color,
         "Piecewise Linear Fit": PiecewiseLinearFit.color,
         "Exponential Saturation Fit": ExponentialSaturationFit.color,
+        "Exponential Decay Fit": ExponentialDecayFit.color,
         "Michaelis-Menten Fit": MichaelisMentenFit.color,
     }
     assert FIT_PALETTE == expected

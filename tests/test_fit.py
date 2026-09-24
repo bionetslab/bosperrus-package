@@ -20,6 +20,7 @@ from bosperrus.fit import (
     ConstantFit,
     PiecewiseLinearFit,
     ExponentialSaturationFit,
+    ExponentialDecayFit,
     MichaelisMentenFit,
 )
 
@@ -323,6 +324,119 @@ class TestExponentialSaturationFit:
 
 
 # ============================================================
+# ExponentialDecayFit
+# ============================================================
+
+class TestExponentialDecayFit:
+    def _ground_truth(self, a=3.0, b=0.5, noise=0.0):
+        C = ExponentialDecayFit.exp_decay(D, a, b)
+        C = C + RNG.normal(0, noise, N)
+        return make_series(C), make_series(D)
+
+    def _fit(self, C, d):
+        f = ExponentialDecayFit(C, d)
+        f.fit()
+        return f
+
+    def test_fit_runs_and_sets_attributes(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        assert f.params is not None
+        assert f.AIC < np.inf
+
+    def test_recovers_known_parameters(self):
+        a_true, b_true = 4.0, 0.3
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.01)
+        f = self._fit(C, d)
+        assert f.params["exponential_decay_a"] == pytest.approx(a_true, rel=0.05)
+        assert f.params["exponential_decay_b"] == pytest.approx(b_true, rel=0.05)
+
+    def test_asymptotes_to_zero_not_an_offset(self):
+        """Unlike ExponentialSaturationFit, there's no c -- predict() at a
+        large d must be close to 0, not some other floor."""
+        a_true, b_true = 4.0, 0.5
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.01)
+        f = self._fit(C, d)
+        assert f.predict(np.array([50.0]))[0] == pytest.approx(0.0, abs=1e-3)
+
+    def test_b_is_positive(self):
+        C, d = self._ground_truth(noise=0.2)
+        f = self._fit(C, d)
+        assert f.params["exponential_decay_b"] > 0
+
+    def test_convergence_distance_analytically_correct(self):
+        # At d_converge = -ln(1 - threshold) / b, exactly (1 - threshold) of a remains
+        a, b = 5.0, 0.4
+        C, d = self._ground_truth(a=a, b=b, noise=0.0)
+        f = self._fit(C, d)
+        threshold = 0.95
+        d_converge = -np.log(1 - threshold) / f.params["exponential_decay_b"]
+        value_at_d_converge = ExponentialDecayFit.exp_decay(
+            d_converge, f.params["exponential_decay_a"], f.params["exponential_decay_b"]
+        )
+        remaining_fraction = value_at_d_converge / f.params["exponential_decay_a"]
+        assert remaining_fraction == pytest.approx(1 - threshold, rel=1e-4)
+
+    def test_fraction_not_converged_in_01(self):
+        C, d = self._ground_truth(noise=0.05)
+        f = self._fit(C, d)
+        assert 0.0 <= f.fraction_not_converged <= 1.0
+
+    def test_fraction_not_converged_invalid_threshold(self):
+        C, d = self._ground_truth()
+        f = ExponentialDecayFit(C, d)
+        with pytest.raises(ValueError):
+            f._calculate_fraction_not_converged(threshold=1.5)
+        with pytest.raises(ValueError):
+            f._calculate_fraction_not_converged(threshold=0.0)
+
+    def test_fraction_not_converged_before_fit_is_none(self):
+        C, d = self._ground_truth()
+        f = ExponentialDecayFit(C, d)
+        assert f.fraction_not_converged is None
+
+    def test_effect_strength_positive_for_decaying_data(self):
+        # a > 0 -> S decreases from a (near d=0) toward 0 -> border > center -> positive
+        C, d = self._ground_truth(a=3.0, b=0.5)
+        f = self._fit(C, d)
+        assert f.observed_effect_strength > 0
+
+    def test_half_life_positive(self):
+        C, d = self._ground_truth(a=3.0, b=0.5)
+        f = self._fit(C, d)
+        assert f.observed_half_life > 0
+
+    def test_aic_better_than_constant_on_decaying_data(self):
+        C, d = self._ground_truth(a=4.0, b=0.4, noise=0.05)
+        const_f = ConstantFit(C, d)
+        const_f.fit()
+        decay_f = self._fit(C, d)
+        assert decay_f.AIC < const_f.AIC
+
+    def test_correct_shifts_toward_zero_not_an_offset(self):
+        a_true, b_true = 4.0, 0.5
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.1)
+        f = self._fit(C, d)
+        corrected = f.correct()
+        np.testing.assert_allclose(corrected, f._S_true - f.S_model)
+
+    def test_attributes_are_immutable(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        with pytest.raises(AttributeError):
+            f.params = {"exponential_decay_a": 999}
+        with pytest.raises(AttributeError):
+            f.S_model = np.zeros(N)
+
+    def test_repr_smoke(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        r = repr(f)
+        assert "ExponentialDecayFit" in r
+        assert "converged" in r
+
+
+# ============================================================
 # MichaelisMentenFit
 # ============================================================
 
@@ -450,7 +564,7 @@ class TestCrossModel:
         distinct per subclass -- the whole point is that a live Fit
         instance (fit.color) or the bare class (ConstantFit.color) both
         expose it directly, no separate lookup table needed."""
-        classes = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]
+        classes = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]
         for cls in classes:
             assert cls.color != Fit.color  # every concrete subclass overrides the base default
         colors = [cls.color for cls in classes]
@@ -459,7 +573,7 @@ class TestCrossModel:
     def test_instance_color_matches_class_color(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             assert f.color == cls.color
 
@@ -467,7 +581,7 @@ class TestCrossModel:
         C = make_series(np.full(N, 3.0))
         d = make_series(D)
         fits = [ConstantFit(C, d), PiecewiseLinearFit(C, d),
-                ExponentialSaturationFit(C, d), MichaelisMentenFit(C, d)]
+                ExponentialSaturationFit(C, d), ExponentialDecayFit(C, d), MichaelisMentenFit(C, d)]
         for f in fits:
             f.fit()
         best = min(fits, key=lambda f: f.AIC)
@@ -476,7 +590,7 @@ class TestCrossModel:
     def test_all_models_have_finite_aic(self):
         C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0) + RNG.normal(0, 0.1, N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             f.fit()
             assert np.isfinite(f.AIC), f"{cls.__name__} produced non-finite AIC"
@@ -484,7 +598,7 @@ class TestCrossModel:
     def test_included_samples_is_one_without_nans(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             assert f.included_samples == pytest.approx(1.0)
 
@@ -500,7 +614,7 @@ class TestCrossModel:
     def test_correct_raises_before_fit(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             with pytest.raises(RuntimeError):
                 f.correct()
@@ -514,7 +628,7 @@ class TestCrossModel:
     def test_all_attributes_immutable_across_models(self):
         C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             f.fit()
             with pytest.raises(AttributeError):
@@ -523,7 +637,7 @@ class TestCrossModel:
     def test_repr_before_fit(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             r = repr(f)
             assert cls.__name__ in r
@@ -555,7 +669,7 @@ class TestCrossModel:
     def test_predict_raises_before_fit(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             with pytest.raises(RuntimeError):
                 f.predict(D)

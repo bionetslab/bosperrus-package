@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from .distances import distance_to_grid_border, distance_to_mask
-from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
+from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, grid_edges
 from .image_masks import get_tissue_mask
 from .pipeline import Flow
@@ -446,13 +446,26 @@ def quantify_diffusion(
     against that distance -- for spots outside the mask only -- separately
     within each component.
 
+    `ExponentialSaturationFit` and `ExponentialDecayFit` both compete for
+    each component (alongside the `ConstantFit` null) via AIC -- the former
+    allows a nonzero far-field offset, the latter forces the far-field value
+    to exactly 0 (appropriate here specifically because `distance` is
+    restricted to spots within a `n_counts > 0`-filtered connected
+    component: the region being fit is bounded exactly by where the signal
+    already hits zero, by construction of how that component was built, not
+    an assumption). Which one wins is decided per component from the data,
+    not assumed.
+
     Reports two cross-sample-comparable diffusion parameters per component
-    (see `per_component` below), mirroring the manuscript's own convention:
-    - `alpha` (counts/um^2): `-a / bin_size_um**2`. Sign-flipped because
-      counts decay *away* from tissue (the raw fit parameter `a` comes out
-      negative), and divided by spot area because raw counts -- and thus
-      `a` -- scale with capture area, not comparable across differently
-      binned samples otherwise.
+    (see `per_component` below), mirroring the manuscript's own convention,
+    computed the same way regardless of which of the two models won:
+    - `alpha` (counts/um^2): the fitted amplitude, sign-corrected to always
+      be positive (for `ExponentialSaturationFit`, `-a`, since its `a` comes
+      out negative when counts decay *away* from tissue toward a nonzero
+      far-field offset; for `ExponentialDecayFit`, `a` directly, since its
+      `a` is already the positive amplitude at the boundary) and divided by
+      spot area, since raw counts -- and thus `a` -- scale with capture
+      area, not comparable across differently binned samples otherwise.
     - `beta` (1/um): the fitted decay rate `b`, already in inverse-um since
       distances are fit directly in um (not native pixels or grid steps).
     Both are `None` for a component where `ConstantFit` won (no detected
@@ -568,13 +581,20 @@ def quantify_diffusion(
             distances=pd.Series(distance[mask_outside], name="distance_outside_mask"),
             scores=pd.DataFrame({score_name: score_values[mask_outside]}),
         )
-        flow.flow(fits=[ConstantFit, ExponentialSaturationFit])
+        flow.flow(fits=[ConstantFit, ExponentialSaturationFit, ExponentialDecayFit])
         best_fit = flow.best_fits[score_name]
 
         alpha = beta = None
         if isinstance(best_fit, ExponentialSaturationFit):
+            # a < 0 here (counts decay away from tissue toward a nonzero
+            # far-field offset a+c), so negate for a positive amplitude.
             alpha = -best_fit.params["exponential_saturation_a"] / spot_area_um2
             beta = best_fit.params["exponential_saturation_b"]
+        elif isinstance(best_fit, ExponentialDecayFit):
+            # a > 0 here (S(0)=a, decaying to exactly 0) -- already the
+            # positive amplitude, no sign flip needed.
+            alpha = best_fit.params["exponential_decay_a"] / spot_area_um2
+            beta = best_fit.params["exponential_decay_b"]
 
         per_component[int(label)] = {
             "best_fit_type": best_fit.name,
@@ -599,6 +619,8 @@ _PREDICT_FORMULAS = {
         d, p["piecewise_linear_b"], p["piecewise_linear_m"], p["piecewise_linear_c"]),
     "Exponential Saturation Fit": lambda d, p: ExponentialSaturationFit.exp_sat(
         d, p["exponential_saturation_a"], p["exponential_saturation_b"], p["exponential_saturation_c"]),
+    "Exponential Decay Fit": lambda d, p: ExponentialDecayFit.exp_decay(
+        d, p["exponential_decay_a"], p["exponential_decay_b"]),
     "Michaelis-Menten Fit": lambda d, p: MichaelisMentenFit.michaelis_menten(
         d, p["michaelis_menten_a"], p["michaelis_menten_b"], p["michaelis_menten_c"]),
 }
