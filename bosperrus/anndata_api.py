@@ -1,22 +1,27 @@
 """AnnData-native convenience wrappers around Flow for spatial-transcriptomics use.
 
-Requires the optional `anndata` dependency (`pip install bosperrus[anndata]`). This
-module never imports `anndata` at the top level -- only inside the two public
-functions below, via `_require_anndata()` -- so the rest of `bosperrus` (and this
-module's own presence in `bosperrus.__all__`) stays importable without it installed,
-mirroring `distances.distance_to_alpha_shape`'s optional-dependency pattern.
+Requires the optional `anndata` dependency (`pip install bosperrus[anndata]`);
+`quantify_diffusion` additionally requires `image-masks`
+(`pip install bosperrus[image-masks]`, for `image_masks.get_tissue_mask`). This
+module never imports `anndata`/`scikit-image` at the top level -- only inside
+the functions that need them, via `_require_anndata()` (and, transitively,
+`image_masks`'s own lazy imports) -- so the rest of `bosperrus` (and this
+module's own presence in `bosperrus.__all__`) stays importable without them
+installed, mirroring `distances.distance_to_alpha_shape`'s optional-dependency
+pattern.
 """
 import warnings
 
 import numpy as np
 import pandas as pd
 
-from .distances import distance_to_grid_border
+from .distances import distance_to_grid_border, distance_to_mask
 from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit
-from .graph_construction import split_into_connected_components, find_grid_border
+from .graph_construction import split_into_connected_components, find_grid_border, grid_edges
+from .image_masks import get_tissue_mask
 from .pipeline import Flow
 
-__all__ = ["identify_analysis_buffer", "correct_layer"]
+__all__ = ["identify_analysis_buffer", "correct_layer", "quantify_diffusion"]
 
 # Below this average component size (kept spots / number of components),
 # warn that components look unreasonably numerous -- usually a sign of
@@ -35,29 +40,36 @@ def _require_anndata():
         )
 
 
-def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
-                              min_component_size, components_key, distance_key):
-    """Shared core of identify_analysis_buffer/correct_layer: split into
-    spatially-connected grid components (see split_into_connected_components),
-    flag border nodes (see find_grid_border), and get each node's distance to
-    its own component's border (see distance_to_grid_border) -- both callers
-    then fit independently per component, never pooled, since components are
+def _validate_numeric_nonneg_column(values, descriptor):
+    """descriptor is a pre-formatted string identifying the offending
+    parameter/column for the error message, e.g. "distance_key='my_col'"."""
+    if not np.issubdtype(values.dtype, np.number):
+        raise ValueError(f"{descriptor} column must be numeric, got dtype {values.dtype}.")
+    finite = np.isfinite(values)
+    if finite.any() and (values[finite] < 0).any():
+        raise ValueError(f"{descriptor} column contains negative values -- distances must be >= 0.")
+
+
+def _get_components(adata, row_key, col_key, grid_type, n_counts_key, min_component_size,
+                     components_key, stacklevel):
+    """Shared component-labeling core of identify_analysis_buffer/
+    correct_layer/quantify_diffusion: split into spatially-connected grid
+    components (see split_into_connected_components) -- every caller then
+    fits independently per component, never pooled, since components are
     e.g. a TMA's individual cores, physically disconnected pieces of tissue.
 
-    components_key/distance_key are each dual-purpose: if that column already
-    exists in adata.obs, it's reused as-is (letting a caller supply their own
-    components, or reuse distances computed by an earlier call); otherwise
-    it's computed here and written to adata.obs under that same key, so every
-    intermediate value ends up visible/reusable, not just the final outputs.
-    Pass None to skip persisting a value that wasn't already present. A
-    reused column is sanity-checked (components must cast to int; distance
-    must be numeric and non-negative) so a bad override fails clearly here,
-    not confusingly later inside the fitting loop.
+    components_key is dual-purpose: if that column already exists in
+    adata.obs, it's reused as-is (letting a caller supply their own
+    components, or reuse labels from an earlier call) -- sanity-checked
+    (must cast to int) so a bad override fails clearly here, not confusingly
+    inside the fitting loop. Otherwise it's computed and written there. Pass
+    None to skip persisting a value that wasn't already present.
 
-    is_border is masked to False wherever components < 0 (n_counts <= 0, or
-    a component dropped by min_component_size), matching the same
-    exclusion semantics as the buffer/correction outputs: nothing meaningful
-    is reported for spots outside the actual analysis.
+    Raises if nothing survived filtering, and warns (at the given
+    stacklevel, so it points at each caller's own caller) if the resulting
+    components look unreasonably numerous relative to how much data
+    survived -- usually a grid_type mismatch, a components_key column that
+    isn't really component labels, or genuinely over-fragmented data.
     """
     row = adata.obs[row_key].to_numpy()
     col = adata.obs[col_key].to_numpy()
@@ -78,27 +90,6 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
         if components_key is not None:
             adata.obs[components_key] = components
 
-    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type) & (components >= 0)
-
-    if distance_key is not None and distance_key in adata.obs:
-        distance = adata.obs[distance_key].to_numpy()
-        if not np.issubdtype(distance.dtype, np.number):
-            raise ValueError(
-                f"distance_key={distance_key!r} column must be numeric, got dtype {distance.dtype}."
-            )
-        finite = np.isfinite(distance)
-        if finite.any() and (distance[finite] < 0).any():
-            raise ValueError(
-                f"distance_key={distance_key!r} column contains negative values -- distances must be >= 0."
-            )
-    else:
-        distance = distance_to_grid_border(
-            row, col, bin_size_um=bin_size_um, n_counts=n_counts,
-            grid_type=grid_type, component_labels=components,
-        ).to_numpy()
-        if distance_key is not None:
-            adata.obs[distance_key] = distance
-
     n_kept = int((components >= 0).sum())
     if n_kept == 0:
         raise ValueError(
@@ -117,8 +108,42 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, b
             f"very small components are unreliable. Check grid_type/components_key, or "
             f"raise min_component_size to drop the smallest fragments.",
             UserWarning,
-            stacklevel=3,
+            stacklevel=stacklevel,
         )
+
+    return row, col, n_counts, components
+
+
+def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+                              min_component_size, components_key, distance_key):
+    """Shared core of identify_analysis_buffer/correct_layer: components (see
+    _get_components), border flags (see find_grid_border), and each node's
+    distance to its own component's border (see distance_to_grid_border).
+
+    distance_key is dual-purpose exactly like components_key (see
+    _get_components) -- reused if already present (sanity-checked: numeric,
+    non-negative), computed and written otherwise.
+
+    is_border is masked to False wherever components < 0 (n_counts <= 0, or
+    a component dropped by min_component_size), matching the same
+    exclusion semantics as the buffer/correction outputs: nothing meaningful
+    is reported for spots outside the actual analysis.
+    """
+    row, col, n_counts, components = _get_components(
+        adata, row_key, col_key, grid_type, n_counts_key, min_component_size, components_key, stacklevel=4,
+    )
+    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type) & (components >= 0)
+
+    if distance_key is not None and distance_key in adata.obs:
+        distance = adata.obs[distance_key].to_numpy()
+        _validate_numeric_nonneg_column(distance, f"distance_key={distance_key!r}")
+    else:
+        distance = distance_to_grid_border(
+            row, col, bin_size_um=bin_size_um, n_counts=n_counts,
+            grid_type=grid_type, component_labels=components,
+        ).to_numpy()
+        if distance_key is not None:
+            adata.obs[distance_key] = distance
 
     return components, distance, is_border
 
@@ -355,5 +380,180 @@ def correct_layer(
 
     adata.layers[key_added] = corrected
     adata.uns[f"{key_added}_fit_quality"] = fit_quality_by_component
+
+    return adata if copy else None
+
+
+def _native_pixel_size_um(row, col, spatial, bin_size_um, grid_type, max_edges=2000):
+    """um per native adata.obsm["spatial"] pixel, measured empirically from
+    the known physical grid pitch (bin_size_um) vs. the pixel distance
+    between grid-adjacent spots -- native pixel size is NOT a fixed
+    constant, it varies per scan, so this can't be a hardcoded conversion
+    factor. Cast to float64 first: some loaders store obsm["spatial"] as an
+    unsigned integer dtype, and a plain difference would silently wrap
+    around instead of going negative."""
+    spatial = np.asarray(spatial, dtype=np.float64)
+    edges = list(grid_edges(row, col, grid_type=grid_type))
+    if not edges:
+        raise ValueError("No grid-adjacent spot pairs found -- can't calibrate native pixel size.")
+    if len(edges) > max_edges:
+        idx = np.random.default_rng(0).choice(len(edges), max_edges, replace=False)
+        edges = [edges[i] for i in idx]
+    u, v = zip(*edges)
+    pixel_pitch = np.median(np.linalg.norm(spatial[list(u)] - spatial[list(v)], axis=1))
+    return bin_size_um / pixel_pitch
+
+
+def quantify_diffusion(
+    adata,
+    library_id,
+    score,
+    row_key="array_row",
+    col_key="array_col",
+    grid_type="rect",
+    n_counts_key=None,
+    bin_size_um=1.0,
+    min_component_size=0,
+    components_key="components",
+    image_key="hires",
+    mask_distance_key="distance_to_mask",
+    key_added="diffusion",
+    segment_kwargs=None,
+    copy=False,
+):
+    """Quantify RNA/signal diffusion outside the tissue boundary, fit
+    independently per spatially-connected grid component (see
+    `identify_analysis_buffer`) -- e.g. a TMA's individual cores each get
+    their own diffusion curve, never pooled into one global fit.
+
+    Finds the sample's image-derived tissue mask (see
+    `image_masks.get_tissue_mask`), computes each spot's physical distance
+    (um) outside that mask (see `distances.distance_to_mask`), and fits
+    `ExponentialSaturationFit` (vs. the `ConstantFit` null) of `score`
+    against that distance -- for spots outside the mask only -- separately
+    within each component.
+
+    Reports two cross-sample-comparable diffusion parameters per component
+    (see `per_component` below), mirroring the manuscript's own convention:
+    - `alpha` (counts/um^2): `-a / bin_size_um**2`. Sign-flipped because
+      counts decay *away* from tissue (the raw fit parameter `a` comes out
+      negative), and divided by spot area because raw counts -- and thus
+      `a` -- scale with capture area, not comparable across differently
+      binned samples otherwise.
+    - `beta` (1/um): the fitted decay rate `b`, already in inverse-um since
+      distances are fit directly in um (not native pixels or grid steps).
+    Both are `None` for a component where `ConstantFit` won (no detected
+    diffusion effect) or where fitting didn't converge.
+
+    Requires the `image-masks` extra in addition to `anndata`
+    (`pip install bosperrus[image-masks]`) -- see `image_masks.get_tissue_mask`.
+
+    Parameters
+    ----------
+    adata : AnnData
+    library_id : str
+        Key into `adata.uns["spatial"]` (see `image_masks.get_hires_image`).
+    score : str or array-like
+        Either the name of an `.obs` column, or an array of values aligned
+        with `adata.obs_names` (typically total counts) to fit against
+        distance outside the mask.
+    row_key, col_key, grid_type, n_counts_key, min_component_size,
+    components_key : see `identify_analysis_buffer`.
+    bin_size_um : float, default 1.0
+        Physical size (um) of one grid step/spot pitch -- used both to
+        calibrate native pixel size (see `_native_pixel_size_um`) and to
+        scale `alpha` by spot area (`bin_size_um ** 2`). Unlike
+        `identify_analysis_buffer`, this isn't just a cosmetic unit choice:
+        leaving it at the default 1.0 directly biases `alpha`'s
+        cross-sample comparability, so pass the real spot pitch.
+    image_key : str, default "hires"
+        Which embedded image to segment -- see `image_masks.get_tissue_mask`.
+    mask_distance_key : str, default "distance_to_mask"
+        `.obs` column for each spot's physical distance (um) outside the
+        tissue mask (0 for spots inside it). Same reuse-if-present,
+        compute-and-write-otherwise behavior as `identify_analysis_buffer`'s
+        `distance_key` -- sanity-checked (numeric, non-negative) if reused.
+    key_added : str, default "diffusion"
+        Per-component fit diagnostics (including `alpha`/`beta`) are stored
+        in `adata.uns[f"{key_added}_fit"]["per_component"]`, keyed by
+        component label (int). There's no natural per-spot boolean output
+        analogous to `identify_analysis_buffer`'s buffer flag here, so
+        nothing else is written besides `components_key`/`mask_distance_key`.
+    segment_kwargs : dict, optional
+        Extra keyword arguments forwarded to
+        `image_masks.segment_tissue_from_rgb` (e.g. `sigma`, `close_radius`).
+    copy : bool, default False
+        If True, return a modified copy of `adata` instead of mutating in place.
+
+    Returns
+    -------
+    AnnData or None
+        The modified AnnData if `copy=True`, else None (`adata` is mutated in place).
+    """
+    _require_anndata()
+    adata = adata.copy() if copy else adata
+
+    row, col, n_counts, components = _get_components(
+        adata, row_key, col_key, grid_type, n_counts_key, min_component_size, components_key, stacklevel=3,
+    )
+
+    if isinstance(score, str):
+        score_values = adata.obs[score].to_numpy()
+        score_name = score
+    else:
+        score_values = np.asarray(score)
+        score_name = "score"
+
+    if mask_distance_key is not None and mask_distance_key in adata.obs:
+        distance = adata.obs[mask_distance_key].to_numpy()
+        _validate_numeric_nonneg_column(distance, f"mask_distance_key={mask_distance_key!r}")
+    else:
+        spatial = adata.obsm["spatial"]
+        pixel_size_um = _native_pixel_size_um(row, col, spatial, bin_size_um, grid_type=grid_type)
+        mask, pixel_scale = get_tissue_mask(adata, library_id, image_key=image_key, **(segment_kwargs or {}))
+        # obsm["spatial"] is (x, y) = (pixel_col, pixel_row); distance_to_mask indexes
+        # the mask array as [row, col], hence the swap.
+        spatial = np.asarray(spatial, dtype=np.float64)
+        coords_mask_space = np.stack([spatial[:, 1] * pixel_scale, spatial[:, 0] * pixel_scale], axis=1)
+        distance = distance_to_mask(
+            coords_mask_space, mask, pixel_size_um=pixel_size_um / pixel_scale,
+        ).to_numpy()
+        if mask_distance_key is not None:
+            adata.obs[mask_distance_key] = distance
+
+    spot_area_um2 = bin_size_um ** 2
+    per_component = {}
+    for label in np.unique(components):
+        if label < 0:
+            continue
+        mask_outside = (components == label) & (distance > 0) & np.isfinite(distance)
+        if not mask_outside.any():
+            continue
+
+        flow = Flow.from_distances_and_scores(
+            distances=pd.Series(distance[mask_outside], name="distance_outside_mask"),
+            scores=pd.DataFrame({score_name: score_values[mask_outside]}),
+        )
+        flow.flow(fits=[ConstantFit, ExponentialSaturationFit])
+        best_fit = flow.best_fits[score_name]
+
+        alpha = beta = None
+        if isinstance(best_fit, ExponentialSaturationFit):
+            alpha = -best_fit.params["exponential_saturation_a"] / spot_area_um2
+            beta = best_fit.params["exponential_saturation_b"]
+
+        per_component[int(label)] = {
+            "best_fit_type": best_fit.name,
+            "params": dict(best_fit.params),
+            "alpha": alpha,
+            "beta": beta,
+            "observed_effect_strength": best_fit.observed_effect_strength,
+            "observed_half_life": best_fit.observed_half_life,
+            "n_spots_outside": int(mask_outside.sum()),
+        }
+
+    adata.uns[f"{key_added}_fit"] = {
+        "grid_type": grid_type, "bin_size_um": bin_size_um, "per_component": per_component,
+    }
 
     return adata if copy else None

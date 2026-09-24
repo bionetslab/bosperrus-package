@@ -6,8 +6,8 @@ import pytest
 
 anndata = pytest.importorskip("anndata", reason="anndata not installed")
 
-from bosperrus.anndata_api import identify_analysis_buffer, correct_layer
-from bosperrus.fit import PiecewiseLinearFit
+from bosperrus.anndata_api import identify_analysis_buffer, correct_layer, quantify_diffusion
+from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit
 
 
 
@@ -492,3 +492,157 @@ def test_correct_layer_fits_components_independently():
     # each component should have detected an effect for exactly one gene, not both/neither
     for genes in detected_effect_genes.values():
         assert len(genes) == 1
+
+
+# ---------------------------------------------------------------------------
+# quantify_diffusion
+# ---------------------------------------------------------------------------
+
+def test_quantify_diffusion_mask_distance_key_overrides_computed_distance():
+    """mask_distance_key reuses that .obs column directly instead of
+    computing via image_masks.get_tissue_mask/distances.distance_to_mask --
+    verified with a known ExponentialSaturationFit signal (a < 0, since
+    counts decay AWAY from tissue) against an injected distance column, and
+    checked against the alpha=-a/bin_size_um**2, beta=b convention."""
+    RNG = np.random.default_rng(42)
+    n_side = 30
+    adata, row, col = _rect_grid_adata(n_side)
+    fake_distance = RNG.uniform(0, 20, size=len(row))
+    adata.obs["my_mask_distance"] = fake_distance
+
+    a_true, b_true, c_true = -4.0, 0.5, 10.0
+    signal = ExponentialSaturationFit.exp_sat(fake_distance, a_true, b_true, c_true)
+    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
+
+    bin_size_um = 8.0
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect",
+        bin_size_um=bin_size_um, mask_distance_key="my_mask_distance",
+    )
+
+    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
+    assert fit_info["best_fit_type"] == "Exponential Saturation Fit"
+    assert fit_info["alpha"] == pytest.approx(-a_true / bin_size_um**2, rel=0.2)
+    assert fit_info["beta"] == pytest.approx(b_true, rel=0.3)
+
+
+def test_quantify_diffusion_no_effect_gives_none_alpha_beta():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
+    )
+
+    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
+    assert fit_info["best_fit_type"] == "Constant Fit"
+    assert fit_info["alpha"] is None
+    assert fit_info["beta"] is None
+
+
+def test_quantify_diffusion_writes_components_and_distance_by_default():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
+    )
+
+    assert "components" in adata.obs
+    assert (adata.obs["components"] == 0).all()
+
+
+def test_quantify_diffusion_non_numeric_mask_distance_key_raises_clear_error():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_mask_distance"] = [f"far_{i}" for i in range(len(row))]
+
+    with pytest.raises(ValueError, match="must be numeric"):
+        quantify_diffusion(
+            adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
+        )
+
+
+def test_quantify_diffusion_negative_mask_distance_key_raises_clear_error():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
+    fake_distance = RNG.uniform(0, 5, size=len(row))
+    fake_distance[0] = -1.0
+    adata.obs["my_mask_distance"] = fake_distance
+
+    with pytest.raises(ValueError, match="contains negative values"):
+        quantify_diffusion(
+            adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
+        )
+
+
+def test_quantify_diffusion_fits_components_independently():
+    """Two disconnected blocks with DIFFERENT true diffusion amplitudes --
+    pooling them into one global fit would blur both; per-component fitting
+    should recover each block's own alpha."""
+    RNG = np.random.default_rng(42)
+    adata, row, col, block_a_mask, n_side, gap = _two_block_adata()
+    fake_distance = RNG.uniform(0, 20, size=len(row))
+    adata.obs["my_mask_distance"] = fake_distance
+
+    a_a, a_b, b_true, c_true = -4.0, -8.0, 0.5, 10.0
+    signal = np.where(
+        block_a_mask,
+        ExponentialSaturationFit.exp_sat(fake_distance, a_a, b_true, c_true),
+        ExponentialSaturationFit.exp_sat(fake_distance, a_b, b_true, c_true),
+    )
+    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect",
+        bin_size_um=1.0, mask_distance_key="my_mask_distance",
+    )
+
+    per_component = adata.uns["diffusion_fit"]["per_component"]
+    assert len(per_component) == 2
+    fitted_alphas = sorted(
+        info["alpha"] for info in per_component.values() if info["alpha"] is not None
+    )
+    assert len(fitted_alphas) == 2
+    assert fitted_alphas[0] == pytest.approx(min(-a_a, -a_b), rel=0.3)
+    assert fitted_alphas[1] == pytest.approx(max(-a_a, -a_b), rel=0.3)
+
+
+def test_quantify_diffusion_computes_mask_distance_from_real_image():
+    """End-to-end smoke test of the real path (no mask_distance_key
+    override): get_tissue_mask segments a synthetic image, native pixel
+    size is calibrated from the grid, and distance_to_mask is computed --
+    checks the result is sane (non-negative, some spots genuinely outside),
+    not exact parameter recovery (covered by the override-based tests above)."""
+    pytest.importorskip("skimage", reason="scikit-image not installed")
+
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    pixel_pitch = 10.0  # native px per grid step
+    adata.obsm["spatial"] = np.column_stack([col * pixel_pitch, row * pixel_pitch]).astype(float)
+
+    size = int(n_side * pixel_pitch) + 20
+    image = np.full((size, size, 3), 255, dtype=np.uint8)
+    lo, hi = int(size * 0.25), int(size * 0.75)
+    image[lo:hi, lo:hi, :] = 30  # dark "tissue" square in the middle
+    adata.uns["spatial"] = {
+        "sample1": {"images": {"hires": image}, "scalefactors": {"tissue_hires_scalef": 1.0}}
+    }
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.5, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="sample1", score="n_counts", grid_type="rect", bin_size_um=8.0,
+        segment_kwargs=dict(sigma=2, close_radius=3, min_hole_area=100, min_object_area=100),
+    )
+
+    assert "distance_to_mask" in adata.obs
+    assert (adata.obs["distance_to_mask"] >= 0).all()
+    assert adata.obs["distance_to_mask"].max() > 0
+    assert "diffusion_fit" in adata.uns
