@@ -645,4 +645,55 @@ def test_quantify_diffusion_computes_mask_distance_from_real_image():
     assert "distance_to_mask" in adata.obs
     assert (adata.obs["distance_to_mask"] >= 0).all()
     assert adata.obs["distance_to_mask"].max() > 0
+
+
+def test_quantify_diffusion_writes_mask_as_plottable_spatial_image():
+    """The computed mask lands in adata.uns["spatial"][library_id]["images"]
+    under mask_image_key, with a matching scalefactor -- the exact shape
+    sc.pl.spatial(adata, library_id=..., img_key=mask_image_key) reads."""
+    pytest.importorskip("skimage", reason="scikit-image not installed")
+
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    pixel_pitch = 10.0
+    adata.obsm["spatial"] = np.column_stack([col * pixel_pitch, row * pixel_pitch]).astype(float)
+
+    size = int(n_side * pixel_pitch) + 20
+    image = np.full((size, size, 3), 255, dtype=np.uint8)
+    lo, hi = int(size * 0.25), int(size * 0.75)
+    image[lo:hi, lo:hi, :] = 30
+    adata.uns["spatial"] = {
+        "sample1": {"images": {"hires": image}, "scalefactors": {"tissue_hires_scalef": 1.0}}
+    }
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.5, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="sample1", score="n_counts", grid_type="rect", bin_size_um=8.0,
+        segment_kwargs=dict(sigma=2, close_radius=3, min_hole_area=100, min_object_area=100),
+    )
+
+    spatial_meta = adata.uns["spatial"]["sample1"]
+    assert "mask" in spatial_meta["images"]
+    mask_image = spatial_meta["images"]["mask"]
+    assert mask_image.shape == image.shape[:2]
+    assert mask_image.dtype == np.uint8
+    assert set(np.unique(mask_image)) <= {0, 255}
+    assert "tissue_mask_scalef" in spatial_meta["scalefactors"]
+    assert spatial_meta["scalefactors"]["tissue_mask_scalef"] == pytest.approx(1.0)
+
+
+def test_quantify_diffusion_no_mask_image_written_when_mask_distance_key_reused():
+    """No mask is computed at all when mask_distance_key is reused, so
+    nothing new should be written to uns["spatial"]."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
+    )
+
+    assert "spatial" not in adata.uns
     assert "diffusion_fit" in adata.uns

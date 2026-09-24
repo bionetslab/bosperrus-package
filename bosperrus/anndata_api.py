@@ -417,6 +417,7 @@ def quantify_diffusion(
     components_key="components",
     image_key="hires",
     mask_distance_key="distance_to_mask",
+    mask_image_key="mask",
     key_added="diffusion",
     segment_kwargs=None,
     copy=False,
@@ -473,6 +474,16 @@ def quantify_diffusion(
         tissue mask (0 for spots inside it). Same reuse-if-present,
         compute-and-write-otherwise behavior as `identify_analysis_buffer`'s
         `distance_key` -- sanity-checked (numeric, non-negative) if reused.
+    mask_image_key : str, default "mask"
+        Writes the segmented mask into `adata.uns["spatial"][library_id]
+        ["images"][mask_image_key]` (plus the matching `scalefactors
+        ["tissue_{mask_image_key}_scalef"]`) -- the same convention
+        `image_masks.get_hires_image` reads from, so you can immediately
+        plot it with `sc.pl.spatial(adata, library_id=library_id,
+        img_key=mask_image_key)`, spots and all, without recomputing it.
+        Only written when the mask is actually computed fresh here (i.e.
+        not when reusing an existing `mask_distance_key`, since then no
+        mask is computed at all). Pass None to skip.
     key_added : str, default "diffusion"
         Per-component fit diagnostics (including `alpha`/`beta`) are stored
         in `adata.uns[f"{key_added}_fit"]["per_component"]`, keyed by
@@ -511,6 +522,9 @@ def quantify_diffusion(
         spatial = adata.obsm["spatial"]
         pixel_size_um = _native_pixel_size_um(row, col, spatial, bin_size_um, grid_type=grid_type)
         mask, pixel_scale = get_tissue_mask(adata, library_id, image_key=image_key, **(segment_kwargs or {}))
+        if mask_image_key is not None:
+            adata.uns["spatial"][library_id]["images"][mask_image_key] = mask.astype(np.uint8) * 255
+            adata.uns["spatial"][library_id]["scalefactors"][f"tissue_{mask_image_key}_scalef"] = pixel_scale
         # obsm["spatial"] is (x, y) = (pixel_col, pixel_row); distance_to_mask indexes
         # the mask array as [row, col], hence the swap.
         spatial = np.asarray(spatial, dtype=np.float64)
