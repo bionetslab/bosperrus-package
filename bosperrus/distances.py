@@ -3,8 +3,12 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree, ConvexHull, distance
 
+from .graph_construction import (
+    split_into_connected_components, find_grid_border, grid_neighbor_graph, grid_to_physical_coords,
+)
+
 __all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_to_mask',
-           'distance_to_convex_hull', 'distance_to_alpha_shape']
+           'distance_to_convex_hull', 'distance_to_alpha_shape', 'distance_to_grid_border']
 
 
 def distance_to_rectangular_border(coordinates):
@@ -41,7 +45,81 @@ def distance_to_pointset(coordinates, pointset):
     return pd.Series(d_min, name="distance_to_pointset")
 
 
-def distance_to_mask(coordinates, mask):
+def distance_to_grid_border(row, col, bin_size_um, n_counts=None, grid_type="rect", component_labels=None):
+    """Per-node physical distance (um) to the nearest border node (see
+    `find_grid_border`), computed within each spatially-connected grid
+    component separately (see `split_into_connected_components`) so a node
+    is never "nearest" to a border point belonging to a different,
+    physically disconnected fragment that just happens to sit close by in
+    raw grid coordinates.
+
+    Distances are computed in true physical space via `grid_to_physical_
+    coords`, not by scaling raw grid-index distance by `bin_size_um` -- that
+    naive approach is exact for `grid_type="rect"` (isotropic) but wrong for
+    `"hex"`, whose two step directions are not an isotropic scaling of one
+    physical pitch (see `grid_to_physical_coords`'s docstring).
+
+    `split_into_connected_components` and `find_grid_border` are both needed
+    here, so the underlying adjacency graph is built once via
+    `grid_neighbor_graph` and shared between them rather than each
+    rebuilding it from scratch.
+
+    Parameters
+    ----------
+    row, col : array-like of int
+        Grid indices, one pair per node, aligned by position.
+    bin_size_um : float
+        Physical size (um) of one grid step/spot pitch.
+    n_counts : array-like, optional
+        Per-node count/signal. Nodes with `n_counts <= 0` are excluded (see
+        `split_into_connected_components`/`find_grid_border`) and get NaN.
+    grid_type : {"hex", "rect"}, default "rect"
+        See `grid_edges`.
+    component_labels : array-like of int, optional
+        Precomputed labels (e.g. reused from a prior `split_into_connected_
+        components` call, such as when the same labels are also needed
+        elsewhere, like cross-sample component matching). Computed
+        internally from `row`/`col`/`n_counts`/`grid_type` if not given.
+
+    Returns
+    -------
+    pd.Series, name "distance_to_grid_border"
+        NaN for excluded nodes (n_counts <= 0, or in a dropped component).
+    """
+    row = np.asarray(row)
+    col = np.asarray(col)
+    if len(row) != len(col):
+        raise ValueError("row and col must have the same length.")
+
+    neighbor_graph = grid_neighbor_graph(row, col, n_counts=n_counts, grid_type=grid_type)
+    if component_labels is None:
+        component_labels = split_into_connected_components(row, col, grid_type=grid_type, neighbor_graph=neighbor_graph)
+    else:
+        component_labels = np.asarray(component_labels)
+    is_border = find_grid_border(row, col, grid_type=grid_type, neighbor_graph=neighbor_graph)
+
+    coords = grid_to_physical_coords(row, col, grid_type=grid_type, bin_size_um=bin_size_um)
+    distance = np.full(len(row), np.nan)
+    for label in np.unique(component_labels):
+        if label < 0:
+            continue
+        member_mask = component_labels == label
+        border_mask = member_mask & is_border
+        if not border_mask.any():
+            continue
+        distance[member_mask] = distance_to_pointset(coords[member_mask], coords[border_mask]).to_numpy()
+
+    return pd.Series(distance, name="distance_to_grid_border")
+
+
+def distance_to_mask(coordinates, mask, pixel_size_um=1.0):
+    """`coordinates` must already be in the mask's own pixel-index space
+    (i.e. caller-side responsibility to convert e.g. a spot's native pixel
+    coordinate into the mask's coordinate system first). `pixel_size_um`
+    converts the resulting pixel-space distance into physical units in one
+    step -- physical size (in your chosen unit, e.g. um) of one pixel in
+    that same coordinate system. Default 1.0 preserves the raw-pixel-distance
+    behavior from before this parameter existed."""
     coordinates = np.asarray(coordinates, dtype=float)
 
     mask_arr = np.asarray(mask)
@@ -57,7 +135,7 @@ def distance_to_mask(coordinates, mask):
 
     # multi-dimensional indexing
     d_vals = dmap[tuple(rounded[:, i] for i in range(rounded.shape[1]))]
-    return pd.Series(d_vals, name="distance_to_mask")
+    return pd.Series(d_vals * pixel_size_um, name="distance_to_mask")
 
 
 def _point_to_segment_distance(points, a, b):

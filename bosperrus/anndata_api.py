@@ -6,17 +6,23 @@ functions below, via `_require_anndata()` -- so the rest of `bosperrus` (and thi
 module's own presence in `bosperrus.__all__`) stays importable without it installed,
 mirroring `distances.distance_to_alpha_shape`'s optional-dependency pattern.
 """
+import warnings
+
 import numpy as np
 import pandas as pd
 
-from .distances import distance_to_pointset
+from .distances import distance_to_grid_border
 from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit
-from .graph_construction import grid_edges
+from .graph_construction import split_into_connected_components, find_grid_border
 from .pipeline import Flow
 
 __all__ = ["identify_analysis_buffer", "correct_layer"]
 
-_GRID_DEGREE = {"hex": 6, "rect": 4}
+# Below this average component size (kept spots / number of components),
+# warn that components look unreasonably numerous -- usually a sign of
+# grid_type mismatch, a bad components_key override, or otherwise
+# over-fragmented data that per-component fits won't handle reliably.
+_MIN_REASONABLE_AVG_COMPONENT_SIZE = 20
 
 
 def _require_anndata():
@@ -29,34 +35,92 @@ def _require_anndata():
         )
 
 
-def _resolve_distance_to_border(adata, row_key, col_key, grid_type, distance_key):
-    if distance_key is not None:
-        if distance_key not in adata.obs:
-            raise KeyError(f"distance_key={distance_key!r} not found in adata.obs.")
-        return adata.obs[distance_key].to_numpy()
+def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+                              min_component_size, components_key, distance_key):
+    """Shared core of identify_analysis_buffer/correct_layer: split into
+    spatially-connected grid components (see split_into_connected_components),
+    flag border nodes (see find_grid_border), and get each node's distance to
+    its own component's border (see distance_to_grid_border) -- both callers
+    then fit independently per component, never pooled, since components are
+    e.g. a TMA's individual cores, physically disconnected pieces of tissue.
 
-    if grid_type not in _GRID_DEGREE:
-        raise ValueError(f"Unknown grid_type: {grid_type!r}. Expected one of {list(_GRID_DEGREE)}.")
+    components_key/distance_key are each dual-purpose: if that column already
+    exists in adata.obs, it's reused as-is (letting a caller supply their own
+    components, or reuse distances computed by an earlier call); otherwise
+    it's computed here and written to adata.obs under that same key, so every
+    intermediate value ends up visible/reusable, not just the final outputs.
+    Pass None to skip persisting a value that wasn't already present. A
+    reused column is sanity-checked (components must cast to int; distance
+    must be numeric and non-negative) so a bad override fails clearly here,
+    not confusingly later inside the fitting loop.
 
+    is_border is masked to False wherever components < 0 (n_counts <= 0, or
+    a component dropped by min_component_size), matching the same
+    exclusion semantics as the buffer/correction outputs: nothing meaningful
+    is reported for spots outside the actual analysis.
+    """
     row = adata.obs[row_key].to_numpy()
     col = adata.obs[col_key].to_numpy()
-    edges = grid_edges(row, col, grid_type=grid_type)
+    n_counts = adata.obs[n_counts_key].to_numpy() if n_counts_key is not None else None
 
-    degree = np.zeros(len(row), dtype=int)
-    for u, v in edges:
-        degree[u] += 1
-        degree[v] += 1
+    if components_key is not None and components_key in adata.obs:
+        try:
+            components = adata.obs[components_key].to_numpy().astype(int)
+        except (ValueError, TypeError) as e:
+            raise ValueError(
+                f"components_key={components_key!r} column isn't usable as integer "
+                f"component labels: {e}"
+            ) from e
+    else:
+        components = split_into_connected_components(
+            row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
+        )
+        if components_key is not None:
+            adata.obs[components_key] = components
 
-    is_border = degree < _GRID_DEGREE[grid_type]
-    if not is_border.any():
+    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type) & (components >= 0)
+
+    if distance_key is not None and distance_key in adata.obs:
+        distance = adata.obs[distance_key].to_numpy()
+        if not np.issubdtype(distance.dtype, np.number):
+            raise ValueError(
+                f"distance_key={distance_key!r} column must be numeric, got dtype {distance.dtype}."
+            )
+        finite = np.isfinite(distance)
+        if finite.any() and (distance[finite] < 0).any():
+            raise ValueError(
+                f"distance_key={distance_key!r} column contains negative values -- distances must be >= 0."
+            )
+    else:
+        distance = distance_to_grid_border(
+            row, col, bin_size_um=bin_size_um, n_counts=n_counts,
+            grid_type=grid_type, component_labels=components,
+        ).to_numpy()
+        if distance_key is not None:
+            adata.obs[distance_key] = distance
+
+    n_kept = int((components >= 0).sum())
+    if n_kept == 0:
         raise ValueError(
-            "No border points detected (every node has a full complement of grid "
-            "neighbors) -- check row_key/col_key/grid_type, or pass distance_key "
-            "directly if you already have a distance-to-border column."
+            "No connected components available for fitting -- either none survived "
+            "n_counts/min_component_size filtering, or components_key is all-excluded. "
+            "Check row_key/col_key/n_counts_key/grid_type/min_component_size/components_key."
         )
 
-    coords = np.column_stack([row, col])
-    return distance_to_pointset(coords, coords[is_border]).to_numpy()
+    n_components = len(np.unique(components[components >= 0]))
+    if n_kept / n_components < _MIN_REASONABLE_AVG_COMPONENT_SIZE:
+        warnings.warn(
+            f"{n_components} components for {n_kept} kept spots (average size "
+            f"{n_kept / n_components:.1f}) -- unusually fragmented. This can mean a "
+            f"grid_type mismatch, a components_key column that isn't really component "
+            f"labels, or genuinely many small/noisy fragments; per-component fits on "
+            f"very small components are unreliable. Check grid_type/components_key, or "
+            f"raise min_component_size to drop the smallest fragments.",
+            UserWarning,
+            stacklevel=3,
+        )
+
+    return components, distance, is_border
 
 
 def identify_analysis_buffer(
@@ -64,19 +128,27 @@ def identify_analysis_buffer(
     score,
     row_key="array_row",
     col_key="array_col",
-    grid_type="hex",
-    distance_key=None,
+    grid_type="rect",
+    n_counts_key=None,
+    bin_size_um=1.0,
+    min_component_size=0,
+    components_key="components",
+    distance_key="distance_to_border",
     key_added="analysis_buffer",
+    border_key="border",
     copy=False,
 ):
-    """Flag spots within the piecewise-linear-fit elbow of the tissue border.
+    """Flag spots within the piecewise-linear-fit elbow of the tissue border,
+    fit independently per spatially-connected grid component (see
+    `split_into_connected_components`) -- e.g. a TMA's individual cores are
+    never pooled into one global elbow.
 
     Fits `PiecewiseLinearFit` (vs. the `ConstantFit` null) of `score` against
-    distance to the nearest border point -- spots with fewer than the full
-    complement of grid neighbors. Writes a boolean column to
-    `adata.obs[key_added]`: True for spots closer to the border than the fitted
-    breakpoint. If `ConstantFit` wins (no detected effect), every spot is flagged
-    False -- there is nothing to call a buffer.
+    distance to the nearest border point, separately within each component.
+    Writes a boolean column to `adata.obs[key_added]`: True for spots closer
+    to their own component's border than that component's fitted breakpoint.
+    A component where `ConstantFit` wins (no detected effect) gets an
+    all-False buffer for its own spots.
 
     Parameters
     ----------
@@ -89,15 +161,47 @@ def identify_analysis_buffer(
         about separately.
     row_key, col_key : str, default "array_row", "array_col"
         `.obs` columns holding discrete grid indices (e.g. Visium's
-        `array_row`/`array_col`). Not used if `distance_key` is given.
-    grid_type : {"hex", "rect"}, default "hex"
-        "hex" (6 neighbors, e.g. Visium) or "rect" (4 neighbors, e.g. Visium HD).
-    distance_key : str, optional
-        If given, must already exist in `adata.obs` -- reused directly, skipping
-        grid construction and border-point detection entirely.
+        `array_row`/`array_col`).
+    grid_type : {"hex", "rect"}, default "rect"
+        "rect" (4 neighbors, e.g. Visium HD/STOmics) or "hex" (6 neighbors,
+        classic Visium's offset hex grid).
+    n_counts_key : str, optional
+        `.obs` column of per-spot counts/signal. If given, spots with
+        `n_counts <= 0` are excluded before splitting into components and
+        computing distances (see `split_into_connected_components`) -- an
+        empty grid position never counts as real tissue.
+    bin_size_um : float, default 1.0
+        Physical size (um) of one grid step, passed to
+        `distance_to_grid_border`. The default of 1.0 fits/reports distances
+        in raw grid-step units; pass the real spot pitch to get `params`
+        (e.g. the elbow breakpoint) in um instead.
+    min_component_size : int, default 0
+        Components with `<= min_component_size` surviving spots are dropped
+        entirely (never fit).
+    components_key : str, default "components"
+        `.obs` column for component labels (see
+        `split_into_connected_components`). If this column already exists,
+        it's reused as-is instead of being recomputed -- e.g. to supply your
+        own component boundaries, or reuse labels from an earlier call.
+        Otherwise it's computed and written here. Pass None to skip writing
+        it (still computed internally either way, since fitting is always
+        per-component). Note: an existing column is *always* reused, even if
+        you've changed `row_key`/`n_counts_key`/`grid_type`/
+        `min_component_size` since it was written -- rename or delete the
+        column first if you want it recomputed.
+    distance_key : str, default "distance_to_border"
+        `.obs` column for each spot's distance to its own component's border
+        (see `distance_to_grid_border`). Same reuse-if-present,
+        compute-and-write-otherwise behavior as `components_key`.
     key_added : str, default "analysis_buffer"
-        `.obs` column name for the output boolean buffer flag. Fit diagnostics are
-        stored in `adata.uns[f"{key_added}_fit"]`.
+        `.obs` column name for the output boolean buffer flag. Per-component
+        fit diagnostics are stored in
+        `adata.uns[f"{key_added}_fit"]["per_component"]`, keyed by component
+        label (int).
+    border_key : str, default "border"
+        `.obs` column name for a boolean flag: True if the spot is itself a
+        border node (see `find_grid_border`), False otherwise -- including
+        for spots excluded by `n_counts_key`/`min_component_size`.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -109,7 +213,11 @@ def identify_analysis_buffer(
     _require_anndata()
     adata = adata.copy() if copy else adata
 
-    distance = _resolve_distance_to_border(adata, row_key, col_key, grid_type, distance_key)
+    components, distance, is_border = _components_and_distance(
+        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+        min_component_size, components_key, distance_key,
+    )
+    adata.obs[border_key] = is_border
 
     if isinstance(score, str):
         score_values = adata.obs[score].to_numpy()
@@ -118,26 +226,36 @@ def identify_analysis_buffer(
         score_values = np.asarray(score)
         score_name = "score"
 
-    flow = Flow.from_distances_and_scores(
-        distances=pd.Series(distance, name="distance_to_border"),
-        scores=pd.DataFrame({score_name: score_values}),
-    )
-    flow.flow(fits=[ConstantFit, PiecewiseLinearFit])
+    buffer = np.zeros(len(components), dtype=bool)
+    per_component = {}
+    for label in np.unique(components):
+        if label < 0:
+            continue
+        mask = (components == label) & np.isfinite(distance)
+        if not mask.any():
+            continue
 
-    best_fit = flow.best_fits[score_name]
-    if isinstance(best_fit, PiecewiseLinearFit):
-        buffer = distance < best_fit.params["piecewise_linear_b"]
-    else:
-        buffer = np.zeros(len(distance), dtype=bool)
+        flow = Flow.from_distances_and_scores(
+            distances=pd.Series(distance[mask], name="distance_to_border"),
+            scores=pd.DataFrame({score_name: score_values[mask]}),
+        )
+        flow.flow(fits=[ConstantFit, PiecewiseLinearFit])
+        best_fit = flow.best_fits[score_name]
+        if isinstance(best_fit, PiecewiseLinearFit):
+            buffer[mask] = distance[mask] < best_fit.params["piecewise_linear_b"]
+
+        per_component[int(label)] = {
+            "best_fit_type": best_fit.name,
+            "params": dict(best_fit.params),
+            "observed_effect_strength": best_fit.observed_effect_strength,
+            "observed_half_life": best_fit.observed_half_life,
+            "affected_fraction": best_fit.fraction_not_converged,
+            "n_spots": int(mask.sum()),
+        }
 
     adata.obs[key_added] = buffer
     adata.uns[f"{key_added}_fit"] = {
-        "best_fit_type": best_fit.name,
-        "params": dict(best_fit.params),
-        "observed_effect_strength": best_fit.observed_effect_strength,
-        "observed_half_life": best_fit.observed_half_life,
-        "affected_fraction": best_fit.fraction_not_converged,
-        "grid_type": grid_type,
+        "grid_type": grid_type, "bin_size_um": bin_size_um, "per_component": per_component,
     }
 
     return adata if copy else None
@@ -148,32 +266,50 @@ def correct_layer(
     layer=None,
     row_key="array_row",
     col_key="array_col",
-    grid_type="hex",
-    distance_key=None,
+    grid_type="rect",
+    n_counts_key=None,
+    bin_size_um=1.0,
+    min_component_size=0,
+    components_key="components",
+    distance_key="distance_to_border",
     key_added="bosperrus_corrected",
+    border_key="border",
     copy=False,
 ):
-    """Correct each feature toward its exponential-saturation asymptote.
+    """Correct each feature toward its exponential-saturation asymptote,
+    fit independently per spatially-connected grid component (see
+    `identify_analysis_buffer`) -- e.g. a TMA's individual cores each get
+    their own correction curve per gene, never pooled into one global fit.
 
-    Fits `ExponentialSaturationFit` (vs. the `ConstantFit` null) of every feature
-    (column) in `layer` against distance to the nearest border point,
-    independently per feature. Writes the corrected matrix to
-    `adata.layers[key_added]`: features where `ConstantFit` wins (no detected
-    effect) pass through unchanged.
+    Fits `ExponentialSaturationFit` (vs. the `ConstantFit` null) of every
+    feature (column) in `layer` against distance to the nearest border
+    point, independently per feature *and* per component. Writes the
+    corrected matrix to `adata.layers[key_added]`: a feature where
+    `ConstantFit` wins within a component (no detected effect) passes
+    through unchanged for that component's spots.
 
-    Note: independently fitting many features (e.g. thousands of genes) means
-    thousands of independent curve fits -- expect runtime to scale roughly
-    linearly with feature count.
+    Note: independently fitting many features across many components means
+    `n_features * n_components` curve fits -- expect runtime to scale
+    accordingly.
 
     Parameters
     ----------
     adata : AnnData
     layer : str, optional
         Name of the `.layers` entry to correct. If None, uses `adata.X`.
-    row_key, col_key, grid_type, distance_key : see `identify_analysis_buffer`.
+    row_key, col_key, grid_type, n_counts_key, bin_size_um,
+    min_component_size, components_key, distance_key : see `identify_analysis_buffer`.
     key_added : str, default "bosperrus_corrected"
-        `.layers` key for the corrected matrix. Per-feature fit diagnostics are
-        stored as new `.var` columns prefixed with `key_added`.
+        `.layers` key for the corrected matrix. Per-component fit-quality
+        DataFrames (mirroring `Flow.fit_quality`: columns = features, rows =
+        `Fit.params_summary()` keys) are stored in
+        `adata.uns[f"{key_added}_fit_quality"]`, keyed by component label (int)
+        -- not `.var` columns, since a feature's winning model can differ
+        between components, which a single flat per-gene column can't represent.
+    border_key : str, default "border"
+        `.obs` column name for a boolean flag: True if the spot is itself a
+        border node (see `find_grid_border`), False otherwise -- including
+        for spots excluded by `n_counts_key`/`min_component_size`.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -187,26 +323,37 @@ def correct_layer(
 
     adata = adata.copy() if copy else adata
 
-    distance = _resolve_distance_to_border(adata, row_key, col_key, grid_type, distance_key)
+    components, distance, is_border = _components_and_distance(
+        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+        min_component_size, components_key, distance_key,
+    )
+    adata.obs[border_key] = is_border
 
     matrix = adata.X if layer is None else adata.layers[layer]
     if sparse.issparse(matrix):
         matrix = matrix.toarray()
-    matrix = np.asarray(matrix)
+    matrix = np.asarray(matrix, dtype=float)
 
-    scores = pd.DataFrame(matrix, columns=adata.var_names)
-    flow = Flow.from_distances_and_scores(
-        distances=pd.Series(distance, name="distance_to_border"),
-        scores=scores,
-    )
-    flow.flow(fits=[ConstantFit, ExponentialSaturationFit])
+    corrected = matrix.copy()
+    fit_quality_by_component = {}
+    for label in np.unique(components):
+        if label < 0:
+            continue
+        mask = (components == label) & np.isfinite(distance)
+        if not mask.any():
+            continue
 
-    corrected_cols = [f"BOSPERRUS corrected {g}" for g in adata.var_names]
-    adata.layers[key_added] = flow.observations[corrected_cols].to_numpy()
+        scores = pd.DataFrame(matrix[mask], columns=adata.var_names)
+        flow = Flow.from_distances_and_scores(
+            distances=pd.Series(distance[mask], name="distance_to_border"),
+            scores=scores,
+        )
+        flow.flow(fits=[ConstantFit, ExponentialSaturationFit])
+        corrected_cols = [f"BOSPERRUS corrected {g}" for g in adata.var_names]
+        corrected[mask] = flow.observations[corrected_cols].to_numpy()
+        fit_quality_by_component[int(label)] = flow.fit_quality
 
-    fit_quality = flow.fit_quality.T
-    adata.var[f"{key_added}_best_fit_type"] = fit_quality["best_fit_type"].to_numpy()
-    adata.var[f"{key_added}_effect_strength"] = fit_quality["observed_effect_strength"].to_numpy()
-    adata.var[f"{key_added}_half_life"] = fit_quality["observed_half_life"].to_numpy()
+    adata.layers[key_added] = corrected
+    adata.uns[f"{key_added}_fit_quality"] = fit_quality_by_component
 
     return adata if copy else None
