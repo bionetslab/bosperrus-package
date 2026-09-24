@@ -11,7 +11,7 @@ import pandas as pd
 
 from .distances import distance_to_grid_border
 from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit
-from .graph_construction import split_into_connected_components
+from .graph_construction import split_into_connected_components, find_grid_border
 from .pipeline import Flow
 
 __all__ = ["identify_analysis_buffer", "correct_layer"]
@@ -30,11 +30,16 @@ def _require_anndata():
 def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key,
                               bin_size_um, min_component_size, distance_key):
     """Shared core of identify_analysis_buffer/correct_layer: split into
-    spatially-connected grid components (see split_into_connected_components)
-    and get each node's distance to its own component's border (see
-    distance_to_grid_border) -- both callers then fit independently per
-    component, never pooled, since components are e.g. a TMA's individual
-    cores, physically disconnected pieces of tissue.
+    spatially-connected grid components (see split_into_connected_components),
+    flag border nodes (see find_grid_border), and get each node's distance to
+    its own component's border (see distance_to_grid_border) -- both callers
+    then fit independently per component, never pooled, since components are
+    e.g. a TMA's individual cores, physically disconnected pieces of tissue.
+
+    is_border is masked to False wherever components < 0 (n_counts <= 0, or
+    a component dropped by min_component_size), matching the same
+    exclusion semantics as the buffer/correction outputs: nothing meaningful
+    is reported for spots outside the actual analysis.
     """
     row = adata.obs[row_key].to_numpy()
     col = adata.obs[col_key].to_numpy()
@@ -43,6 +48,7 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key,
     components = split_into_connected_components(
         row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
     )
+    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type) & (components >= 0)
 
     if distance_key is not None:
         if distance_key not in adata.obs:
@@ -59,7 +65,7 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key,
             "No connected components survived n_counts/min_component_size filtering -- "
             "nothing to fit. Check row_key/col_key/n_counts_key/grid_type/min_component_size."
         )
-    return components, distance
+    return components, distance, is_border
 
 
 def identify_analysis_buffer(
@@ -73,6 +79,7 @@ def identify_analysis_buffer(
     min_component_size=0,
     distance_key=None,
     key_added="analysis_buffer",
+    border_key="border",
     copy=False,
 ):
     """Flag spots within the piecewise-linear-fit elbow of the tissue border,
@@ -126,6 +133,10 @@ def identify_analysis_buffer(
         fit diagnostics are stored in
         `adata.uns[f"{key_added}_fit"]["per_component"]`, keyed by component
         label (int).
+    border_key : str, default "border"
+        `.obs` column name for a boolean flag: True if the spot is itself a
+        border node (see `find_grid_border`), False otherwise -- including
+        for spots excluded by `n_counts_key`/`min_component_size`.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -137,9 +148,10 @@ def identify_analysis_buffer(
     _require_anndata()
     adata = adata.copy() if copy else adata
 
-    components, distance = _components_and_distance(
+    components, distance, is_border = _components_and_distance(
         adata, row_key, col_key, grid_type, n_counts_key, bin_size_um, min_component_size, distance_key,
     )
+    adata.obs[border_key] = is_border
 
     if isinstance(score, str):
         score_values = adata.obs[score].to_numpy()
@@ -194,6 +206,7 @@ def correct_layer(
     min_component_size=0,
     distance_key=None,
     key_added="bosperrus_corrected",
+    border_key="border",
     copy=False,
 ):
     """Correct each feature toward its exponential-saturation asymptote,
@@ -226,6 +239,10 @@ def correct_layer(
         `adata.uns[f"{key_added}_fit_quality"]`, keyed by component label (int)
         -- not `.var` columns, since a feature's winning model can differ
         between components, which a single flat per-gene column can't represent.
+    border_key : str, default "border"
+        `.obs` column name for a boolean flag: True if the spot is itself a
+        border node (see `find_grid_border`), False otherwise -- including
+        for spots excluded by `n_counts_key`/`min_component_size`.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -239,9 +256,10 @@ def correct_layer(
 
     adata = adata.copy() if copy else adata
 
-    components, distance = _components_and_distance(
+    components, distance, is_border = _components_and_distance(
         adata, row_key, col_key, grid_type, n_counts_key, bin_size_um, min_component_size, distance_key,
     )
+    adata.obs[border_key] = is_border
 
     matrix = adata.X if layer is None else adata.layers[layer]
     if sparse.issparse(matrix):

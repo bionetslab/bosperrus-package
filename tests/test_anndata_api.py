@@ -213,6 +213,40 @@ def test_identify_analysis_buffer_no_surviving_components_raises():
         identify_analysis_buffer(adata, score="score", grid_type="rect", n_counts_key="n_counts")
 
 
+def test_identify_analysis_buffer_writes_border_column():
+    """Corner spots (degree 2 on a rect grid) are border; the center-ish
+    interior spot (degree 4) is not; a spot excluded via n_counts_key is
+    never flagged as border even if it would otherwise be one."""
+    RNG = np.random.default_rng(42)
+    n_side = 10
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    n_counts = np.ones(len(row))
+    corner_idx = 0  # (row=0, col=0)
+    interior_idx = np.flatnonzero((row == n_side // 2) & (col == n_side // 2))[0]
+    n_counts[corner_idx] = 0  # this corner is excluded -- should read False despite being a true border node
+    adata.obs["n_counts"] = n_counts
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect", n_counts_key="n_counts")
+
+    assert "border" in adata.obs
+    assert adata.obs["border"].dtype == bool
+    assert not adata.obs["border"].iloc[corner_idx]  # excluded, despite true topological border status
+    assert not adata.obs["border"].iloc[interior_idx]
+    other_corner = np.flatnonzero((row == n_side - 1) & (col == n_side - 1))[0]
+    assert adata.obs["border"].iloc[other_corner]
+
+
+def test_identify_analysis_buffer_border_key_is_configurable():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect", border_key="is_border_spot")
+    assert "is_border_spot" in adata.obs
+    assert "border" not in adata.obs
+
+
 # ---------------------------------------------------------------------------
 # correct_layer
 # ---------------------------------------------------------------------------
@@ -290,6 +324,24 @@ def test_correct_layer_copy_does_not_mutate_original():
     assert result is not None
     assert "bosperrus_corrected" not in adata.layers
     assert "bosperrus_corrected" in result.layers
+
+
+def test_correct_layer_writes_border_column():
+    RNG = np.random.default_rng(42)
+    n_side = 10
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.X = np.column_stack([
+        RNG.normal(5.0, 0.05, size=len(row)),
+        RNG.normal(3.0, 0.05, size=len(row)),
+    ])
+
+    correct_layer(adata, grid_type="rect")
+
+    assert "border" in adata.obs
+    assert adata.obs["border"].dtype == bool
+    assert adata.obs["border"].iloc[0]  # corner (0,0), degree 2
+    interior_idx = np.flatnonzero((row == n_side // 2) & (col == n_side // 2))[0]
+    assert not adata.obs["border"].iloc[interior_idx]
 
 
 def test_correct_layer_fits_components_independently():
