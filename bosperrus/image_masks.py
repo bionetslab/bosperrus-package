@@ -43,6 +43,14 @@ def get_hires_image(adata, library_id, image_key="hires"):
     """Extract an AnnData's own embedded image and its pixel scale factor
     (scanpy/squidpy convention: `adata.uns["spatial"][library_id]`).
 
+    Only works for platforms whose reader embeds an image directly in the
+    AnnData this way -- e.g. 10x Visium. Platforms that ship tissue
+    images/masks as separate files instead (e.g. STOmics/Stereo-seq) have
+    no `adata.uns["spatial"]` at all and will raise a `KeyError` here with
+    guidance to compute the mask distance yourself and pass it to
+    `quantify_diffusion` via `mask_distance_key` instead of relying on this
+    function.
+
     Parameters
     ----------
     adata : AnnData
@@ -63,7 +71,25 @@ def get_hires_image(adata, library_id, image_key="hires"):
         following this convention use to align spots to a non-fullres image.
     """
     _require_anndata()
+    if "spatial" not in adata.uns:
+        raise KeyError(
+            "adata.uns['spatial'] not found. get_hires_image/get_tissue_mask only work for platforms "
+            "whose reader embeds an image directly in the AnnData (the scanpy/squidpy convention, e.g. "
+            "10x Visium). If this sample stores its tissue mask/image as a separate file instead (e.g. "
+            "STOmics/Stereo-seq), compute a distance-to-mask array yourself and pass it to "
+            "quantify_diffusion via mask_distance_key instead of relying on this function."
+        )
+    if library_id not in adata.uns["spatial"]:
+        raise KeyError(
+            f"library_id={library_id!r} not found in adata.uns['spatial']. "
+            f"Available: {list(adata.uns['spatial'])}."
+        )
     spatial_meta = adata.uns["spatial"][library_id]
+    if image_key not in spatial_meta["images"]:
+        raise KeyError(
+            f"image_key={image_key!r} not found in adata.uns['spatial'][{library_id!r}]['images']. "
+            f"Available: {list(spatial_meta['images'])}."
+        )
     image = spatial_meta["images"][image_key]
     pixel_scale = float(spatial_meta["scalefactors"][f"tissue_{image_key}_scalef"])
     return image, pixel_scale

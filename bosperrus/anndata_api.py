@@ -461,6 +461,14 @@ def quantify_diffusion(
     Requires the `image-masks` extra in addition to `anndata`
     (`pip install bosperrus[image-masks]`) -- see `image_masks.get_tissue_mask`.
 
+    The default mask lookup only works out of the box for platforms whose
+    reader embeds an image directly in the AnnData, following the
+    scanpy/squidpy `adata.uns["spatial"][library_id]` convention (e.g. 10x
+    Visium). Platforms that ship tissue images/masks as separate files
+    instead (e.g. STOmics/Stereo-seq) aren't covered -- compute a
+    distance-to-mask array yourself (see `distances.distance_to_mask`) and
+    pass it via `mask_distance_key` to skip the image lookup entirely.
+
     Parameters
     ----------
     adata : AnnData

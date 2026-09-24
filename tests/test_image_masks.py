@@ -72,6 +72,26 @@ def test_get_hires_image_respects_image_key():
     assert got_scale == pytest.approx(0.05)
 
 
+def test_get_hires_image_missing_uns_spatial_raises_clear_error():
+    """The exact STOmics/Stereo-seq case: no adata.uns["spatial"] at all,
+    since that platform's reader never embeds an image in the AnnData."""
+    adata = anndata.AnnData(X=np.zeros((3, 2)), obs=pd.DataFrame(index=["a", "b", "c"]))
+    with pytest.raises(KeyError, match="only work for platforms"):
+        get_hires_image(adata, "sample1")
+
+
+def test_get_hires_image_missing_library_id_raises_clear_error():
+    adata = _adata_with_image(library_id="sample1")
+    with pytest.raises(KeyError, match="library_id='other_sample' not found"):
+        get_hires_image(adata, "other_sample")
+
+
+def test_get_hires_image_missing_image_key_raises_clear_error():
+    adata = _adata_with_image(library_id="sample1")
+    with pytest.raises(KeyError, match="image_key='lowres' not found"):
+        get_hires_image(adata, "sample1", image_key="lowres")
+
+
 # ---------------------------------------------------------------------------
 # get_tissue_mask
 # ---------------------------------------------------------------------------
