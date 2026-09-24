@@ -262,6 +262,32 @@ def test_distance_to_grid_border_reuses_precomputed_component_labels(rect_block_
     np.testing.assert_allclose(d_reused.to_numpy(), d_computed.to_numpy())
 
 
+@pytest.fixture
+def hex_grid_rowcol():
+    """3 rows x offset hex layout, deterministic (matches
+    test_graph_construction.py's fixture of the same name). Node (1,3)
+    (index 6) and (1,5) (index 7) are the only two interior (non-border)
+    nodes; both have border nodes among their immediate hex neighbors at
+    offsets (-1,+-1)/(1,+-1) -- raw grid-index Euclidean distance to those
+    is sqrt(2), but the true physical hex-pitch distance is exactly one
+    step, since all 6 grid_edges hex offsets are equidistant in reality."""
+    row = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 2])
+    col = np.array([0, 2, 4, 6, 8, 1, 3, 5, 7, 0, 2, 4, 6, 8])
+    return row, col
+
+
+def test_distance_to_grid_border_hex_uses_correct_physical_geometry(hex_grid_rowcol):
+    """A naive scalar-multiply-by-bin_size_um implementation would give
+    sqrt(2)*bin_size_um for nodes 6/7 (their nearest border neighbors sit at
+    raw grid-index distance sqrt(2)); the physically correct answer is
+    exactly bin_size_um, since every hex offset is one true hex-pitch apart."""
+    row, col = hex_grid_rowcol
+    d = distance_to_grid_border(row, col, bin_size_um=3.0, grid_type="hex")
+    assert d.iloc[6] == pytest.approx(3.0)
+    assert d.iloc[7] == pytest.approx(3.0)
+    assert d.iloc[0] == pytest.approx(0.0)  # corner is itself a border node
+
+
 # ---------------------------------------------------------------------------
 # distance_to_alpha_shape
 # ---------------------------------------------------------------------------

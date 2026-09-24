@@ -3,7 +3,9 @@ import pandas as pd
 from scipy.ndimage import distance_transform_edt
 from scipy.spatial import cKDTree, ConvexHull, distance
 
-from .graph_construction import split_into_connected_components, find_grid_border
+from .graph_construction import (
+    split_into_connected_components, find_grid_border, grid_neighbor_graph, grid_to_physical_coords,
+)
 
 __all__ = ['distance_to_rectangular_border', 'distance_to_pointset', 'distance_to_mask',
            'distance_to_convex_hull', 'distance_to_alpha_shape', 'distance_to_grid_border']
@@ -51,15 +53,23 @@ def distance_to_grid_border(row, col, bin_size_um, n_counts=None, grid_type="rec
     physically disconnected fragment that just happens to sit close by in
     raw grid coordinates.
 
+    Distances are computed in true physical space via `grid_to_physical_
+    coords`, not by scaling raw grid-index distance by `bin_size_um` -- that
+    naive approach is exact for `grid_type="rect"` (isotropic) but wrong for
+    `"hex"`, whose two step directions are not an isotropic scaling of one
+    physical pitch (see `grid_to_physical_coords`'s docstring).
+
+    `split_into_connected_components` and `find_grid_border` are both needed
+    here, so the underlying adjacency graph is built once via
+    `grid_neighbor_graph` and shared between them rather than each
+    rebuilding it from scratch.
+
     Parameters
     ----------
     row, col : array-like of int
         Grid indices, one pair per node, aligned by position.
     bin_size_um : float
-        Physical size (um) of one grid step. Assumes an isotropic grid
-        (row-step and col-step both span `bin_size_um`) -- exact for
-        `grid_type="rect"`, but only an approximation for `"hex"`, whose two
-        axes are not an isotropic scaling of a single physical pitch.
+        Physical size (um) of one grid step/spot pitch.
     n_counts : array-like, optional
         Per-node count/signal. Nodes with `n_counts <= 0` are excluded (see
         `split_into_connected_components`/`find_grid_border`) and get NaN.
@@ -81,13 +91,14 @@ def distance_to_grid_border(row, col, bin_size_um, n_counts=None, grid_type="rec
     if len(row) != len(col):
         raise ValueError("row and col must have the same length.")
 
+    neighbor_graph = grid_neighbor_graph(row, col, n_counts=n_counts, grid_type=grid_type)
     if component_labels is None:
-        component_labels = split_into_connected_components(row, col, n_counts=n_counts, grid_type=grid_type)
+        component_labels = split_into_connected_components(row, col, grid_type=grid_type, neighbor_graph=neighbor_graph)
     else:
         component_labels = np.asarray(component_labels)
-    is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type)
+    is_border = find_grid_border(row, col, grid_type=grid_type, neighbor_graph=neighbor_graph)
 
-    coords = np.column_stack([row, col])
+    coords = grid_to_physical_coords(row, col, grid_type=grid_type, bin_size_um=bin_size_um)
     distance = np.full(len(row), np.nan)
     for label in np.unique(component_labels):
         if label < 0:
@@ -98,7 +109,7 @@ def distance_to_grid_border(row, col, bin_size_um, n_counts=None, grid_type="rec
             continue
         distance[member_mask] = distance_to_pointset(coords[member_mask], coords[border_mask]).to_numpy()
 
-    return pd.Series(distance * bin_size_um, name="distance_to_grid_border")
+    return pd.Series(distance, name="distance_to_grid_border")
 
 
 def distance_to_mask(coordinates, mask, pixel_size_um=1.0):

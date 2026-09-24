@@ -8,6 +8,8 @@ from bosperrus.graph_construction import (
     grid_edges,
     split_into_connected_components,
     find_grid_border,
+    grid_to_physical_coords,
+    grid_neighbor_graph,
 )
 
 
@@ -331,3 +333,73 @@ def test_find_grid_border_invalid_grid_type(rect_grid_rowcol):
 def test_find_grid_border_mismatched_length_raises():
     with pytest.raises(ValueError, match="same length"):
         find_grid_border(np.array([0, 1, 2]), np.array([0, 1]))
+
+
+# ---------------------------------------------------------------------------
+# grid_to_physical_coords
+# ---------------------------------------------------------------------------
+
+def test_grid_to_physical_coords_rect_is_isotropic_scale():
+    row = np.array([0, 1, 2])
+    col = np.array([0, 1, 2])
+    coords = grid_to_physical_coords(row, col, grid_type="rect", bin_size_um=2.5)
+    np.testing.assert_allclose(coords, np.column_stack([col * 2.5, row * 2.5]))
+
+
+def test_grid_to_physical_coords_hex_all_offsets_equidistant():
+    """Every one of grid_edges' hex neighbor offsets must map to exactly
+    bin_size_um apart -- the whole point of not treating (row, col) as
+    isotropic Cartesian for hex (unlike "rect", (0,2) and (1,1) steps are
+    NOT equidistant in raw index space, sqrt(2) vs 2, even though they are
+    physically equidistant on the real hex lattice)."""
+    bin_size_um = 3.0
+    origin = grid_to_physical_coords(np.array([5]), np.array([5]), grid_type="hex", bin_size_um=bin_size_um)[0]
+    for dr, dc in [(0, -2), (0, 2), (-1, -1), (-1, 1), (1, -1), (1, 1)]:
+        neighbor = grid_to_physical_coords(
+            np.array([5 + dr]), np.array([5 + dc]), grid_type="hex", bin_size_um=bin_size_um
+        )[0]
+        assert np.linalg.norm(neighbor - origin) == pytest.approx(bin_size_um)
+
+
+def test_grid_to_physical_coords_invalid_grid_type():
+    with pytest.raises(ValueError, match="Unknown grid_type"):
+        grid_to_physical_coords(np.array([0]), np.array([0]), grid_type="invalid")
+
+
+# ---------------------------------------------------------------------------
+# grid_neighbor_graph
+# ---------------------------------------------------------------------------
+
+def test_grid_neighbor_graph_empty_when_all_excluded():
+    row = np.array([0, 1, 2])
+    col = np.array([0, 1, 2])
+    kept_idx, adjacency = grid_neighbor_graph(row, col, n_counts=np.zeros(3), grid_type="rect")
+    assert len(kept_idx) == 0
+    assert adjacency is None
+
+
+def test_grid_neighbor_graph_reused_matches_default_split(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    neighbor_graph = grid_neighbor_graph(row, col, grid_type="rect")
+    labels_reused = split_into_connected_components(row, col, grid_type="rect", neighbor_graph=neighbor_graph)
+    labels_default = split_into_connected_components(row, col, grid_type="rect")
+    np.testing.assert_array_equal(labels_reused, labels_default)
+
+
+def test_grid_neighbor_graph_reused_matches_default_border(rect_grid_rowcol):
+    row, col = rect_grid_rowcol
+    neighbor_graph = grid_neighbor_graph(row, col, grid_type="rect")
+    border_reused = find_grid_border(row, col, grid_type="rect", neighbor_graph=neighbor_graph)
+    border_default = find_grid_border(row, col, grid_type="rect")
+    np.testing.assert_array_equal(border_reused, border_default)
+
+
+def test_grid_neighbor_graph_reused_matches_default_hex(hex_grid_rowcol):
+    row, col = hex_grid_rowcol
+    neighbor_graph = grid_neighbor_graph(row, col, grid_type="hex")
+    labels_reused = split_into_connected_components(row, col, grid_type="hex", neighbor_graph=neighbor_graph)
+    labels_default = split_into_connected_components(row, col, grid_type="hex")
+    np.testing.assert_array_equal(labels_reused, labels_default)
+    border_reused = find_grid_border(row, col, grid_type="hex", neighbor_graph=neighbor_graph)
+    border_default = find_grid_border(row, col, grid_type="hex")
+    np.testing.assert_array_equal(border_reused, border_default)
