@@ -91,8 +91,16 @@ def _get_components(adata, row_key, col_key, grid_type, n_counts_key, min_compon
         components = split_into_connected_components(
             row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
         )
-        if components_key is not None:
-            adata.obs[components_key] = components
+
+    if components_key is not None:
+        # Always (re)write the int-cast array back, even when reused from an
+        # existing column -- otherwise a column stored in some other dtype
+        # (e.g. str, from adata.obs["components"] = components.astype(str))
+        # keeps that dtype on disk while every fit ran against the in-memory
+        # int-cast copy, so a later caller re-reading adata.obs[components_key]
+        # directly (e.g. plot_border_effect/plot_diffusion) gets values that
+        # never match the int component labels stored in *_fit["per_component"].
+        adata.obs[components_key] = components
 
     n_kept = int((components >= 0).sum())
     if n_kept == 0:

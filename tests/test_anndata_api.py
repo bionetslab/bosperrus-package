@@ -203,6 +203,24 @@ def test_identify_analysis_buffer_components_key_reuses_existing_column():
     np.testing.assert_array_equal(adata.obs["my_components"].to_numpy(), fake_components)
 
 
+def test_identify_analysis_buffer_normalizes_reused_components_key_dtype():
+    """A reused components_key column stored as strings (e.g. from an
+    earlier `adata.obs["components"] = components.astype(str)` for
+    plotting) must come back out as int afterward -- otherwise a later
+    re-read of adata.obs[components_key] (e.g. by plot_border_effect) can
+    never match per_component's int keys via `components == label`."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["components"] = np.zeros(len(row), dtype=int).astype(str)
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect")
+
+    stored = adata.obs["components"].to_numpy()
+    assert np.issubdtype(stored.dtype, np.integer)
+    assert (stored == 0).all()
+
+
 def test_identify_analysis_buffer_non_numeric_components_key_raises_clear_error():
     RNG = np.random.default_rng(42)
     adata, row, col = _rect_grid_adata()
@@ -733,6 +751,26 @@ def test_plot_border_effect_raises_without_prior_run():
     adata.obs["score"] = np.zeros(len(row))
     with pytest.raises(KeyError, match="run identify_analysis_buffer first"):
         plot_border_effect(adata, score="score")
+
+
+def test_plot_border_effect_works_after_reused_string_components_key():
+    """Regression test for the exact bug this fixed: a pre-existing
+    components column stored as strings must not break plot_border_effect's
+    later re-read of adata.obs["components"]."""
+    RNG = np.random.default_rng(42)
+    n_side = 30
+    adata, row, col = _rect_grid_adata(n_side)
+    d_true = _distance_to_nearest_edge(row, col, n_side)
+    b_true, m_true, c_true = 5.0, -1.0, 10.0
+    signal = PiecewiseLinearFit.piecewise_plateau(d_true, b_true, m_true, c_true)
+    adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
+    adata.obs["components"] = np.zeros(len(row), dtype=int).astype(str)
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    fig = plot_border_effect(adata, score="score")
+
+    assert len(fig.get_axes()[0].get_lines()) == 1
+    plt.close(fig)
 
 
 def test_plot_diffusion_one_subplot_per_component():
