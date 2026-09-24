@@ -27,14 +27,21 @@ def _require_anndata():
         )
 
 
-def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key,
-                              bin_size_um, min_component_size, distance_key):
+def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+                              min_component_size, components_key, distance_key):
     """Shared core of identify_analysis_buffer/correct_layer: split into
     spatially-connected grid components (see split_into_connected_components),
     flag border nodes (see find_grid_border), and get each node's distance to
     its own component's border (see distance_to_grid_border) -- both callers
     then fit independently per component, never pooled, since components are
     e.g. a TMA's individual cores, physically disconnected pieces of tissue.
+
+    components_key/distance_key are each dual-purpose: if that column already
+    exists in adata.obs, it's reused as-is (letting a caller supply their own
+    components, or reuse distances computed by an earlier call); otherwise
+    it's computed here and written to adata.obs under that same key, so every
+    intermediate value ends up visible/reusable, not just the final outputs.
+    Pass None to skip persisting a value that wasn't already present.
 
     is_border is masked to False wherever components < 0 (n_counts <= 0, or
     a component dropped by min_component_size), matching the same
@@ -45,20 +52,26 @@ def _components_and_distance(adata, row_key, col_key, grid_type, n_counts_key,
     col = adata.obs[col_key].to_numpy()
     n_counts = adata.obs[n_counts_key].to_numpy() if n_counts_key is not None else None
 
-    components = split_into_connected_components(
-        row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
-    )
+    if components_key is not None and components_key in adata.obs:
+        components = adata.obs[components_key].to_numpy().astype(int)
+    else:
+        components = split_into_connected_components(
+            row, col, n_counts=n_counts, grid_type=grid_type, min_size=min_component_size,
+        )
+        if components_key is not None:
+            adata.obs[components_key] = components
+
     is_border = find_grid_border(row, col, n_counts=n_counts, grid_type=grid_type) & (components >= 0)
 
-    if distance_key is not None:
-        if distance_key not in adata.obs:
-            raise KeyError(f"distance_key={distance_key!r} not found in adata.obs.")
+    if distance_key is not None and distance_key in adata.obs:
         distance = adata.obs[distance_key].to_numpy()
     else:
         distance = distance_to_grid_border(
             row, col, bin_size_um=bin_size_um, n_counts=n_counts,
             grid_type=grid_type, component_labels=components,
         ).to_numpy()
+        if distance_key is not None:
+            adata.obs[distance_key] = distance
 
     if not (components >= 0).any():
         raise ValueError(
@@ -77,7 +90,8 @@ def identify_analysis_buffer(
     n_counts_key=None,
     bin_size_um=1.0,
     min_component_size=0,
-    distance_key=None,
+    components_key="components",
+    distance_key="distance_to_border",
     key_added="analysis_buffer",
     border_key="border",
     copy=False,
@@ -122,12 +136,21 @@ def identify_analysis_buffer(
     min_component_size : int, default 0
         Components with `<= min_component_size` surviving spots are dropped
         entirely (never fit).
-    distance_key : str, optional
-        If given, must already exist in `adata.obs` -- reused directly as
-        each spot's distance-to-border, instead of computing it via
-        `distance_to_grid_border`. Components are still (re)computed from
-        `row_key`/`col_key`/`n_counts_key`/`grid_type` regardless, since
-        fitting is always per-component.
+    components_key : str, default "components"
+        `.obs` column for component labels (see
+        `split_into_connected_components`). If this column already exists,
+        it's reused as-is instead of being recomputed -- e.g. to supply your
+        own component boundaries, or reuse labels from an earlier call.
+        Otherwise it's computed and written here. Pass None to skip writing
+        it (still computed internally either way, since fitting is always
+        per-component). Note: an existing column is *always* reused, even if
+        you've changed `row_key`/`n_counts_key`/`grid_type`/
+        `min_component_size` since it was written -- rename or delete the
+        column first if you want it recomputed.
+    distance_key : str, default "distance_to_border"
+        `.obs` column for each spot's distance to its own component's border
+        (see `distance_to_grid_border`). Same reuse-if-present,
+        compute-and-write-otherwise behavior as `components_key`.
     key_added : str, default "analysis_buffer"
         `.obs` column name for the output boolean buffer flag. Per-component
         fit diagnostics are stored in
@@ -149,7 +172,8 @@ def identify_analysis_buffer(
     adata = adata.copy() if copy else adata
 
     components, distance, is_border = _components_and_distance(
-        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um, min_component_size, distance_key,
+        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+        min_component_size, components_key, distance_key,
     )
     adata.obs[border_key] = is_border
 
@@ -204,7 +228,8 @@ def correct_layer(
     n_counts_key=None,
     bin_size_um=1.0,
     min_component_size=0,
-    distance_key=None,
+    components_key="components",
+    distance_key="distance_to_border",
     key_added="bosperrus_corrected",
     border_key="border",
     copy=False,
@@ -231,7 +256,7 @@ def correct_layer(
     layer : str, optional
         Name of the `.layers` entry to correct. If None, uses `adata.X`.
     row_key, col_key, grid_type, n_counts_key, bin_size_um,
-    min_component_size, distance_key : see `identify_analysis_buffer`.
+    min_component_size, components_key, distance_key : see `identify_analysis_buffer`.
     key_added : str, default "bosperrus_corrected"
         `.layers` key for the corrected matrix. Per-component fit-quality
         DataFrames (mirroring `Flow.fit_quality`: columns = features, rows =
@@ -257,7 +282,8 @@ def correct_layer(
     adata = adata.copy() if copy else adata
 
     components, distance, is_border = _components_and_distance(
-        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um, min_component_size, distance_key,
+        adata, row_key, col_key, grid_type, n_counts_key, bin_size_um,
+        min_component_size, components_key, distance_key,
     )
     adata.obs[border_key] = is_border
 

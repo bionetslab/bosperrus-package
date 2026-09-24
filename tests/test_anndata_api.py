@@ -148,12 +148,54 @@ def test_identify_analysis_buffer_distance_key_overrides_computed_distance():
     )
 
 
-def test_identify_analysis_buffer_missing_distance_key_raises():
+def test_identify_analysis_buffer_new_distance_key_gets_computed_and_written():
+    """A distance_key that doesn't yet exist is computed (not an error) and
+    written to that column -- distance_key is reuse-if-present, not a
+    strict require-if-given override."""
     RNG = np.random.default_rng(42)
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
-    with pytest.raises(KeyError, match="not found in adata.obs"):
-        identify_analysis_buffer(adata, score="score", distance_key="does_not_exist")
+    assert "my_new_distance" not in adata.obs
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_new_distance")
+
+    assert "my_new_distance" in adata.obs
+    assert (adata.obs["my_new_distance"] >= 0).all()
+
+
+def test_identify_analysis_buffer_writes_components_and_distance_by_default():
+    """Every intermediate value computed along the way (components, distance
+    to border) lands in .obs by default, not just the final buffer/border
+    outputs."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect")
+
+    assert "components" in adata.obs
+    assert "distance_to_border" in adata.obs
+    assert (adata.obs["components"] == 0).all()  # single connected block
+    assert (adata.obs["distance_to_border"] >= 0).all()
+
+
+def test_identify_analysis_buffer_components_key_reuses_existing_column():
+    """An existing components_key column is reused as-is, overriding
+    split_into_connected_components -- verified by supplying a deliberately
+    wrong labeling (splits the single connected block into two fake halves)
+    and checking the fit is actually computed per that fake split."""
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    fake_components = np.where(col < n_side // 2, 0, 1)
+    adata.obs["my_components"] = fake_components
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+
+    per_component = adata.uns["analysis_buffer_fit"]["per_component"]
+    assert set(per_component) == {0, 1}
+    np.testing.assert_array_equal(adata.obs["my_components"].to_numpy(), fake_components)
 
 
 def test_identify_analysis_buffer_n_counts_key_excludes_zero_count_spots():
@@ -342,6 +384,21 @@ def test_correct_layer_writes_border_column():
     assert adata.obs["border"].iloc[0]  # corner (0,0), degree 2
     interior_idx = np.flatnonzero((row == n_side // 2) & (col == n_side // 2))[0]
     assert not adata.obs["border"].iloc[interior_idx]
+
+
+def test_correct_layer_writes_components_and_distance_by_default():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.X = np.column_stack([
+        RNG.normal(5.0, 0.05, size=len(row)),
+        RNG.normal(3.0, 0.05, size=len(row)),
+    ])
+
+    correct_layer(adata, grid_type="rect")
+
+    assert "components" in adata.obs
+    assert "distance_to_border" in adata.obs
+    assert (adata.obs["components"] == 0).all()
 
 
 def test_correct_layer_fits_components_independently():
