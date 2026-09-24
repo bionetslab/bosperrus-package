@@ -190,7 +190,31 @@ class Fit():
         which automatically expands the result back to the original index.
         """
         raise NotImplementedError("Subclasses should implement this method")
-    
+
+    def predict(self, d):
+        """
+        Evaluate the fitted model at arbitrary new distance values.
+
+        Must be called after fit(). Unlike S_model (only defined at the
+        original training d's), this accepts any d -- e.g. a fine grid for
+        plotting the fitted curve. Subclasses implement this with their own
+        model formula and self.params, giving a uniform interface so a
+        caller (e.g. generic plotting code) can evaluate any fitted Fit
+        without needing to know its concrete subclass. On a fit that failed
+        to converge, self.params holds NaN, so this naturally returns NaN
+        rather than raising.
+
+        Parameters
+        ----------
+        d : array-like
+            Distance values to evaluate the model at.
+
+        Returns
+        -------
+        np.ndarray
+        """
+        raise NotImplementedError("Subclasses should implement this method")
+
     def fit_correct(self):
         """Convenience method: fit the model and, if converged, return the corrected signal."""
         self.fit()
@@ -300,6 +324,12 @@ class ConstantFit(Fit):
             raise RuntimeError("fit() must be called before correct()")
         self._S_corrected = self._S_true
         return self.S_corrected
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        d = np.asarray(d, dtype=float)
+        return np.full_like(d, self._params["constant_c"])
 
 
 class PiecewiseLinearFit(Fit):
@@ -429,6 +459,13 @@ class PiecewiseLinearFit(Fit):
             self._S_corrected = self._S_true
         return self.S_corrected # this calls the getter function of the property and extends to original index
 
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.piecewise_plateau(
+            d, self._params["piecewise_linear_b"], self._params["piecewise_linear_m"], self._params["piecewise_linear_c"]
+        )
+
 
 class ExponentialSaturationFit(Fit):
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
@@ -524,6 +561,14 @@ class ExponentialSaturationFit(Fit):
         else:
             self._S_corrected = self._S_true
         return self.S_corrected
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.exp_sat(
+            d, self._params["exponential_saturation_a"], self._params["exponential_saturation_b"],
+            self._params["exponential_saturation_c"],
+        )
 
 
 class MichaelisMentenFit(Fit):
@@ -625,4 +670,11 @@ class MichaelisMentenFit(Fit):
         else:
             self._S_corrected = self._S_true
         return self.S_corrected
-    
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.michaelis_menten(
+            d, self._params["michaelis_menten_a"], self._params["michaelis_menten_b"], self._params["michaelis_menten_c"]
+        )
+

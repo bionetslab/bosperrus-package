@@ -510,6 +510,37 @@ class TestCrossModel:
             assert cls.__name__ in r
             assert "not fitted" in r
 
+    def test_predict_matches_model_formula(self):
+        """predict() must agree exactly with each subclass's own static model
+        formula evaluated at the fitted params -- the whole point of a
+        uniform predict() is that callers don't need to know which formula
+        to call by hand."""
+        C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0) + RNG.normal(0, 0.05, N))
+        d = make_series(D)
+        d_new = np.linspace(0, 20, 50)  # extrapolates past the training range
+        cases = [
+            (ConstantFit, lambda f, x: np.full_like(x, f.params["constant_c"], dtype=float)),
+            (PiecewiseLinearFit, lambda f, x: PiecewiseLinearFit.piecewise_plateau(
+                x, f.params["piecewise_linear_b"], f.params["piecewise_linear_m"], f.params["piecewise_linear_c"])),
+            (ExponentialSaturationFit, lambda f, x: ExponentialSaturationFit.exp_sat(
+                x, f.params["exponential_saturation_a"], f.params["exponential_saturation_b"],
+                f.params["exponential_saturation_c"])),
+            (MichaelisMentenFit, lambda f, x: MichaelisMentenFit.michaelis_menten(
+                x, f.params["michaelis_menten_a"], f.params["michaelis_menten_b"], f.params["michaelis_menten_c"])),
+        ]
+        for cls, expected_formula in cases:
+            f = cls(C, d)
+            f.fit()
+            np.testing.assert_allclose(f.predict(d_new), expected_formula(f, d_new))
+
+    def test_predict_raises_before_fit(self):
+        C = make_series(np.ones(N))
+        d = make_series(D)
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+            f = cls(C, d)
+            with pytest.raises(RuntimeError):
+                f.predict(D)
+
 
 # ============================================================
 # Regression tests — bugs that were fixed

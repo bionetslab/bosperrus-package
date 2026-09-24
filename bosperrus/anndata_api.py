@@ -16,12 +16,16 @@ import numpy as np
 import pandas as pd
 
 from .distances import distance_to_grid_border, distance_to_mask
-from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit
+from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, grid_edges
 from .image_masks import get_tissue_mask
 from .pipeline import Flow
+from .plotting import plot_fit
 
-__all__ = ["identify_analysis_buffer", "correct_layer", "quantify_diffusion"]
+__all__ = [
+    "identify_analysis_buffer", "correct_layer", "quantify_diffusion",
+    "plot_border_effect", "plot_diffusion",
+]
 
 # Below this average component size (kept spots / number of components),
 # warn that components look unreasonably numerous -- usually a sign of
@@ -563,7 +567,7 @@ def quantify_diffusion(
             "beta": beta,
             "observed_effect_strength": best_fit.observed_effect_strength,
             "observed_half_life": best_fit.observed_half_life,
-            "n_spots_outside": int(mask_outside.sum()),
+            "n_spots": int(mask_outside.sum()),
         }
 
     adata.uns[f"{key_added}_fit"] = {
@@ -571,3 +575,146 @@ def quantify_diffusion(
     }
 
     return adata if copy else None
+
+
+_PREDICT_FORMULAS = {
+    "Constant Fit": lambda d, p: np.full_like(np.asarray(d, dtype=float), p["constant_c"]),
+    "Piecewise Linear Fit": lambda d, p: PiecewiseLinearFit.piecewise_plateau(
+        d, p["piecewise_linear_b"], p["piecewise_linear_m"], p["piecewise_linear_c"]),
+    "Exponential Saturation Fit": lambda d, p: ExponentialSaturationFit.exp_sat(
+        d, p["exponential_saturation_a"], p["exponential_saturation_b"], p["exponential_saturation_c"]),
+    "Michaelis-Menten Fit": lambda d, p: MichaelisMentenFit.michaelis_menten(
+        d, p["michaelis_menten_a"], p["michaelis_menten_b"], p["michaelis_menten_c"]),
+}
+
+
+def _predict_from_params(best_fit_type, params):
+    """Reconstruct a `d -> predicted score` callable from a stored
+    best_fit_type/params pair (as saved in adata.uns[...]["per_component"]),
+    without needing a live Fit instance -- Fit objects aren't
+    AnnData/h5ad-serializable, so only best_fit_type/params (already plain
+    dicts/floats) are ever persisted to .uns, and this rebuilds a usable
+    predictor from just those, mirroring each Fit subclass's own predict()."""
+    try:
+        formula = _PREDICT_FORMULAS[best_fit_type]
+    except KeyError:
+        raise ValueError(f"Unknown best_fit_type {best_fit_type!r} -- can't reconstruct the fitted curve.")
+    return lambda d: formula(d, params)
+
+
+def _plot_per_component_fit(score_values, distance, components, per_component, xlabel, ncols, figsize, **plot_fit_kwargs):
+    import matplotlib.pyplot as plt
+
+    labels = sorted(per_component)
+    if not labels:
+        raise ValueError("No per-component fits to plot.")
+
+    nrows = int(np.ceil(len(labels) / ncols))
+    if figsize is None:
+        figsize = (4 * ncols, 3 * nrows)
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    axes = axes.ravel()
+
+    for ax, label in zip(axes, labels):
+        info = per_component[label]
+        member_mask = components == label
+        predict_fn = _predict_from_params(info["best_fit_type"], info["params"])
+        plot_fit(ax, distance[member_mask], score_values[member_mask], predict_fn, **plot_fit_kwargs)
+        ax.set_xlabel(xlabel)
+        ax.set_title(f"component {label} (n={info['n_spots']}, {info['best_fit_type']})", fontsize=9)
+
+    for ax in axes[len(labels):]:
+        ax.axis("off")
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_border_effect(adata, score, distance_key="distance_to_border", components_key="components",
+                        key_added="analysis_buffer", ncols=4, figsize=None, **plot_fit_kwargs):
+    """Plot `score` vs. distance-to-border with each component's fitted
+    elbow curve overlaid on top (see `identify_analysis_buffer`, which must
+    be run first -- this reads its stored results, it doesn't fit anything
+    itself). One subplot per component.
+
+    Parameters
+    ----------
+    adata : AnnData
+    score : str or array-like
+        Same score `identify_analysis_buffer` was run with.
+    distance_key, components_key, key_added : see `identify_analysis_buffer`
+        -- must match the values it was actually called with, since this
+        reads `adata.obs[distance_key]`/`adata.obs[components_key]` and
+        `adata.uns[f"{key_added}_fit"]["per_component"]`.
+    ncols : int, default 4
+        Subplot grid width.
+    figsize : (float, float), optional
+        Defaults to `(4 * ncols, 3 * nrows)`.
+    **plot_fit_kwargs
+        Forwarded to `plotting.plot_fit` (e.g. `bins`, `hist_kwargs`, `line_kwargs`).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    _require_anndata()
+    fit_key = f"{key_added}_fit"
+    if fit_key not in adata.uns:
+        raise KeyError(f"{fit_key!r} not found in adata.uns -- run identify_analysis_buffer first.")
+
+    score_values = adata.obs[score].to_numpy() if isinstance(score, str) else np.asarray(score)
+    distance = adata.obs[distance_key].to_numpy()
+    components = adata.obs[components_key].to_numpy()
+    per_component = adata.uns[fit_key]["per_component"]
+
+    return _plot_per_component_fit(
+        score_values, distance, components, per_component,
+        xlabel="distance to border", ncols=ncols, figsize=figsize, **plot_fit_kwargs,
+    )
+
+
+def plot_diffusion(adata, score, mask_distance_key="distance_to_mask", components_key="components",
+                    key_added="diffusion", ncols=4, figsize=None, **plot_fit_kwargs):
+    """Plot `score` vs. distance outside the tissue mask with each
+    component's fitted diffusion curve overlaid on top (see
+    `quantify_diffusion`, which must be run first -- this reads its stored
+    results, it doesn't fit anything itself). Only spots outside the mask
+    (distance > 0) are shown, matching exactly what `quantify_diffusion`
+    itself fits against. One subplot per component.
+
+    Parameters
+    ----------
+    adata : AnnData
+    score : str or array-like
+        Same score `quantify_diffusion` was run with.
+    mask_distance_key, components_key, key_added : see `quantify_diffusion`
+        -- must match the values it was actually called with, since this
+        reads `adata.obs[mask_distance_key]`/`adata.obs[components_key]` and
+        `adata.uns[f"{key_added}_fit"]["per_component"]`.
+    ncols : int, default 4
+        Subplot grid width.
+    figsize : (float, float), optional
+        Defaults to `(4 * ncols, 3 * nrows)`.
+    **plot_fit_kwargs
+        Forwarded to `plotting.plot_fit` (e.g. `bins`, `hist_kwargs`, `line_kwargs`).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    _require_anndata()
+    fit_key = f"{key_added}_fit"
+    if fit_key not in adata.uns:
+        raise KeyError(f"{fit_key!r} not found in adata.uns -- run quantify_diffusion first.")
+
+    score_values = adata.obs[score].to_numpy() if isinstance(score, str) else np.asarray(score)
+    distance = adata.obs[mask_distance_key].to_numpy()
+    outside = distance > 0
+    components = np.where(outside, adata.obs[components_key].to_numpy(), -1)
+    distance = np.where(outside, distance, np.nan)
+    per_component = adata.uns[fit_key]["per_component"]
+
+    return _plot_per_component_fit(
+        score_values, distance, components, per_component,
+        xlabel="distance outside mask", ncols=ncols, figsize=figsize, **plot_fit_kwargs,
+    )

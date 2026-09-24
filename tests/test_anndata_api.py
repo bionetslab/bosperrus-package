@@ -1,12 +1,15 @@
 import warnings
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
 
 anndata = pytest.importorskip("anndata", reason="anndata not installed")
 
-from bosperrus.anndata_api import identify_analysis_buffer, correct_layer, quantify_diffusion
+from bosperrus.anndata_api import (
+    identify_analysis_buffer, correct_layer, quantify_diffusion, plot_border_effect, plot_diffusion,
+)
 from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit
 
 
@@ -697,3 +700,70 @@ def test_quantify_diffusion_no_mask_image_written_when_mask_distance_key_reused(
 
     assert "spatial" not in adata.uns
     assert "diffusion_fit" in adata.uns
+
+
+# ---------------------------------------------------------------------------
+# plot_border_effect / plot_diffusion
+# ---------------------------------------------------------------------------
+
+def test_plot_border_effect_one_subplot_per_component():
+    RNG = np.random.default_rng(42)
+    adata, row, col, block_a_mask, n_side, gap = _two_block_adata(n_side=30)
+    d_true = np.where(
+        block_a_mask,
+        _distance_to_nearest_edge(row, col, n_side, row_offset=0),
+        _distance_to_nearest_edge(row, col, n_side, row_offset=gap),
+    )
+    b_true, m_true, c_true = 5.0, -1.0, 10.0
+    signal = PiecewiseLinearFit.piecewise_plateau(d_true, b_true, m_true, c_true)
+    adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
+
+    identify_analysis_buffer(adata, score="score", grid_type="rect")
+
+    fig = plot_border_effect(adata, score="score", ncols=4)
+    n_components = len(adata.uns["analysis_buffer_fit"]["per_component"])
+    assert n_components == 2
+    lines_per_axes = [len(ax.get_lines()) for ax in fig.get_axes()]
+    assert sum(1 for n in lines_per_axes if n == 1) == n_components
+    plt.close(fig)
+
+
+def test_plot_border_effect_raises_without_prior_run():
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = np.zeros(len(row))
+    with pytest.raises(KeyError, match="run identify_analysis_buffer first"):
+        plot_border_effect(adata, score="score")
+
+
+def test_plot_diffusion_one_subplot_per_component():
+    RNG = np.random.default_rng(42)
+    adata, row, col, block_a_mask, n_side, gap = _two_block_adata()
+    fake_distance = RNG.uniform(0, 20, size=len(row))
+    adata.obs["my_mask_distance"] = fake_distance
+
+    a_a, a_b, b_true, c_true = -4.0, -8.0, 0.5, 10.0
+    signal = np.where(
+        block_a_mask,
+        ExponentialSaturationFit.exp_sat(fake_distance, a_a, b_true, c_true),
+        ExponentialSaturationFit.exp_sat(fake_distance, a_b, b_true, c_true),
+    )
+    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
+
+    quantify_diffusion(
+        adata, library_id="unused", score="n_counts", grid_type="rect",
+        bin_size_um=1.0, mask_distance_key="my_mask_distance",
+    )
+
+    fig = plot_diffusion(adata, score="n_counts", mask_distance_key="my_mask_distance")
+    n_components = len(adata.uns["diffusion_fit"]["per_component"])
+    assert n_components == 2
+    lines_per_axes = [len(ax.get_lines()) for ax in fig.get_axes()]
+    assert sum(1 for n in lines_per_axes if n == 1) == n_components
+    plt.close(fig)
+
+
+def test_plot_diffusion_raises_without_prior_run():
+    adata, row, col = _rect_grid_adata()
+    adata.obs["n_counts"] = np.zeros(len(row))
+    with pytest.raises(KeyError, match="run quantify_diffusion first"):
+        plot_diffusion(adata, score="n_counts")

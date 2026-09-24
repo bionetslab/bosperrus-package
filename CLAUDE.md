@@ -67,6 +67,7 @@ All fit models subclass `Fit`. The base class:
 |---|---|
 | `fit()` | Estimate params; set `_params`, `_S_model`, `_converged`; call `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`, `_score()` on success |
 | `correct()` | Set `_S_corrected`; return `self.S_corrected` (the property, not the raw array) |
+| `predict(d)` | Evaluate the fitted model at arbitrary new `d` (not just the training points) using `self.params` and the subclass's own model formula — the uniform interface `plotting.py` (and any other generic code) uses to draw a fitted curve without knowing the concrete subclass |
 | `_rate_observed_metrics()` | Set `_observed_effect_strength` and `_observed_half_life` from fitted params |
 | `_calculate_fraction_not_converged(threshold)` | Set `_fraction_not_converged`; `threshold` may be ignored for hard-boundary models |
 
@@ -129,7 +130,7 @@ Tests live in `tests/test_fit.py` and cover all four `Fit` subclasses plus cross
 ## Adding a new fit model
 
 1. Subclass `Fit` in `fit.py`.
-2. Implement `fit()`, `correct()`, `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`.
+2. Implement `fit()`, `correct()`, `predict(d)`, `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`.
 3. Set `self._name` in `__init__`.
 4. Name param dict keys as `{snake_case_model_name}_{param}` (e.g. `my_model_a`).
 5. Add to the default `fits` list in `Flow.flow()` if it should run by default.
