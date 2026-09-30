@@ -67,6 +67,7 @@ All fit models subclass `Fit`. The base class:
 |---|---|
 | `fit()` | Estimate params; set `_params`, `_S_model`, `_converged`; call `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`, `_score()` on success |
 | `correct()` | Set `_S_corrected`; return `self.S_corrected` (the property, not the raw array) |
+| `predict(d)` | Evaluate the fitted model at arbitrary new `d` (not just the training points) using `self.params` and the subclass's own model formula — the uniform interface `plotting.py` (and any other generic code) uses to draw a fitted curve without knowing the concrete subclass |
 | `_rate_observed_metrics()` | Set `_observed_effect_strength` and `_observed_half_life` from fitted params |
 | `_calculate_fraction_not_converged(threshold)` | Set `_fraction_not_converged`; `threshold` may be ignored for hard-boundary models |
 
@@ -79,11 +80,12 @@ All fit models subclass `Fit`. The base class:
 | `ConstantFit` | `c` (mean; null/baseline model) | `constant_c` |
 | `PiecewiseLinearFit` | `m*d + c` for `d ≤ b`, plateau at `m*b + c` for `d > b` | `piecewise_linear_b`, `piecewise_linear_m`, `piecewise_linear_c` |
 | `ExponentialSaturationFit` | `a*(1 - exp(-b*d)) + c`, `b > 0` | `exponential_saturation_a`, `exponential_saturation_b`, `exponential_saturation_c` |
+| `ExponentialDecayFit` | `a*exp(-b*d)`, `b > 0` (no offset -- asymptotes to exactly 0) | `exponential_decay_a`, `exponential_decay_b` |
 | `MichaelisMentenFit` | `a*d/(b+d) + c`, `b > 0` (Km = `b`) | `michaelis_menten_a`, `michaelis_menten_b`, `michaelis_menten_c` |
 
 **Correction formula**: all saturation models shift raw values to the asymptote: `S_corrected = S_true + (asymptote - S_model)`. If fitting fails (`_converged = False`), `S_corrected = S_true` (passthrough).
 
-**PiecewiseLinearFit** is special: it uses `scipy.optimize.curve_fit` followed by optional `differential_evolution` refinement seeded around the `curve_fit` solution. `fraction_not_converged` is the fraction of nodes with `d ≤ b` (hard boundary, not asymptotic).
+**Global fitting (all non-constant models):** every model is linear in its amplitude/offset and nonlinear in one parameter b, so `fit()` never uses a single-start local optimizer (that got stuck in local optima on real data). `PiecewiseLinearFit` solves the knot exactly: for b between two consecutive distinct distances the objective has a closed-form stationary point, and all intervals are evaluated via cumulative sums (`fraction_not_converged` is the fraction of nodes with `d <= b`). `ExponentialSaturationFit`/`MichaelisMentenFit`/`ExponentialDecayFit` scan b over a data-driven log grid with an exact linear solve per b (`_profile_fit`), then refine with bounded 1-D minimisation.
 
 ### Model selection (`flow.flow()`)
 
@@ -129,8 +131,8 @@ Tests live in `tests/test_fit.py` and cover all four `Fit` subclasses plus cross
 ## Adding a new fit model
 
 1. Subclass `Fit` in `fit.py`.
-2. Implement `fit()`, `correct()`, `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`.
-3. Set `self._name` in `__init__`.
+2. Implement `fit()`, `correct()`, `predict(d)`, `_rate_observed_metrics()`, `_calculate_fraction_not_converged()`.
+3. Set `self._name` in `__init__`; set `color = "#hexvalue"` as a class attribute (not in `__init__`) -- if you skip this, `Fit`'s own `color = "C1"` default applies, and `plotting.FIT_PALETTE` (derived from each subclass's `color`) falls back to `plot_fit`'s own default too.
 4. Name param dict keys as `{snake_case_model_name}_{param}` (e.g. `my_model_a`).
 5. Add to the default `fits` list in `Flow.flow()` if it should run by default.
 6. Add a `TestMyModelFit` class in `tests/test_fit.py` mirroring the existing test structure.

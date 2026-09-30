@@ -1,14 +1,107 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit, differential_evolution
+from scipy.optimize import minimize_scalar
 from .evaluate_fit import log_likelihood, akaike_information_criterion
 
 _EPS = 1e-10
 _DEFAULT_CONVERGENCE_THRESHOLD = 0.95
 
-__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'MichaelisMentenFit']
+# Every non-constant model here is linear in its amplitude/offset and nonlinear in
+# exactly one parameter b: S(d) = a * g(d, b) [+ c]. For fixed b the best a (and c)
+# is an exact linear least-squares solution, so the fit reduces to minimising the
+# 1-D profile SSE(b) ("variable projection"). SSE(b) can have several local minima
+# (and long flat valleys towards degenerate limits: linear as b -> 0 / infinity, a
+# step at the other end), which a single-start local optimizer such as curve_fit
+# can't escape -- so b is found by an exact scan over a grid covering the whole
+# data-supported range, then refined by bounded 1-D minimisation between the best
+# grid point's neighbours.
+_N_B_GRID = 200
+
+
+def _linear_solve(x, y, intercept):
+    """Least squares y ~ a*x (+ c); returns (a, c, sse), or None if x is degenerate."""
+    n = len(y)
+    if intercept:
+        x_mean, y_mean = x.mean(), y.mean()
+        xc = x - x_mean
+        sxx = np.dot(xc, xc)
+        if sxx <= 1e-12 * max(1.0, np.dot(x, x)):
+            return None
+        a = np.dot(xc, y - y_mean) / sxx
+        c = y_mean - a * x_mean
+    else:
+        sxx = np.dot(x, x)
+        if sxx <= 1e-300:
+            return None
+        a, c = np.dot(x, y) / sxx, 0.0
+    r = y - (a * x + c)
+    return a, c, float(np.dot(r, r))
+
+
+def _profile_fit(d, y, basis, b_grid, intercept, refine=True, log_scale=True):
+    """Global least-squares fit of y ~ a*basis(d, b) (+ c) over b: exact scan of
+    b_grid, then bounded 1-D refinement between the best grid point's neighbours.
+    Returns (a, b, c). Raises RuntimeError if no b gives a non-degenerate fit."""
+    d = np.asarray(d, dtype=float)
+    y = np.asarray(y, dtype=float)
+    b_grid = np.asarray(b_grid, dtype=float)
+    sse = np.full(len(b_grid), np.inf)
+    for i, b in enumerate(b_grid):
+        sol = _linear_solve(basis(d, b), y, intercept)
+        if sol is not None:
+            sse[i] = sol[2]
+    if not np.isfinite(sse).any():
+        raise RuntimeError("no non-degenerate fit over the b grid")
+    i = int(np.argmin(sse))
+    b_best = b_grid[i]
+    if refine and len(b_grid) > 1:
+        lo, hi = b_grid[max(i - 1, 0)], b_grid[min(i + 1, len(b_grid) - 1)]
+        t = np.log if log_scale else (lambda v: v)
+        t_inv = np.exp if log_scale else (lambda v: v)
+
+        def profile(tb):
+            sol = _linear_solve(basis(d, t_inv(tb)), y, intercept)
+            return np.inf if sol is None else sol[2]
+
+        res = minimize_scalar(profile, bounds=(t(lo), t(hi)), method="bounded", options={"xatol": 1e-6})
+        if res.success and res.fun < sse[i]:
+            b_best = float(t_inv(res.x))
+    a, c, _ = _linear_solve(basis(d, b_best), y, intercept)
+    return a, float(b_best), c
+
+
+def _rate_grid(d, n=_N_B_GRID):
+    """Log grid for a rate b (1/distance) spanning every scale the data can
+    resolve: from 1e-3 / range(d) (effectively linear over the data) to
+    1e3 / smallest positive d (effectively a step at the first distance)."""
+    d = np.asarray(d, dtype=float)
+    d_pos = d[d > 0]
+    span = np.ptp(d) if np.ptp(d) > 0 else 1.0
+    d_min = d_pos.min() if len(d_pos) else span
+    return np.logspace(np.log10(1e-3 / span), np.log10(1e3 / d_min), n)
+
+
+def _scale_grid(d, n=_N_B_GRID):
+    """Log grid for a half-saturation distance b: 1e-3 * smallest positive d
+    (a step) to 1e3 * max(d) (effectively linear over the data)."""
+    d = np.asarray(d, dtype=float)
+    d_pos = d[d > 0]
+    d_max = d.max() if d.max() > 0 else 1.0
+    d_min = d_pos.min() if len(d_pos) else d_max
+    return np.logspace(np.log10(1e-3 * d_min), np.log10(1e3 * d_max), n)
+
+__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'ExponentialDecayFit', 'MichaelisMentenFit']
 
 class Fit():
+    color = "C1"
+    """Canonical display color for this model type (a class attribute, so
+    it's readable without instantiating, e.g. `ConstantFit.color`, and every
+    instance exposes it directly, e.g. `fit.color` -- no separate lookup
+    table needed). Subclasses override this with their own hex value;
+    `"C1"` here is just the fallback for a Fit subclass that doesn't bother
+    setting one. `plotting.FIT_PALETTE` is built from these, not the other
+    way around -- this is the single source of truth."""
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Base class for all curve-fitting models applied to S_true as a function of d.
@@ -172,7 +265,7 @@ class Fit():
             result[self._mask] = filtered_data
             return result
 
-    def fit(self):
+    def fit(self, maxfev=2000):
         """
         Estimate model parameters from S_true and d.
 
@@ -190,7 +283,31 @@ class Fit():
         which automatically expands the result back to the original index.
         """
         raise NotImplementedError("Subclasses should implement this method")
-    
+
+    def predict(self, d):
+        """
+        Evaluate the fitted model at arbitrary new distance values.
+
+        Must be called after fit(). Unlike S_model (only defined at the
+        original training d's), this accepts any d -- e.g. a fine grid for
+        plotting the fitted curve. Subclasses implement this with their own
+        model formula and self.params, giving a uniform interface so a
+        caller (e.g. generic plotting code) can evaluate any fitted Fit
+        without needing to know its concrete subclass. On a fit that failed
+        to converge, self.params holds NaN, so this naturally returns NaN
+        rather than raising.
+
+        Parameters
+        ----------
+        d : array-like
+            Distance values to evaluate the model at.
+
+        Returns
+        -------
+        np.ndarray
+        """
+        raise NotImplementedError("Subclasses should implement this method")
+
     def fit_correct(self):
         """Convenience method: fit the model and, if converged, return the corrected signal."""
         self.fit()
@@ -248,6 +365,8 @@ class Fit():
 
 
 class ConstantFit(Fit):
+    color = "#24592F"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series = None):
         """
         Fits a horizontal constant (the mean of S_true) as the null/baseline model.
@@ -301,16 +420,28 @@ class ConstantFit(Fit):
         self._S_corrected = self._S_true
         return self.S_corrected
 
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        d = np.asarray(d, dtype=float)
+        return np.full_like(d, self._params["constant_c"])
+
 
 class PiecewiseLinearFit(Fit):
+    color = "#0033FF"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits a piecewise linear model with a plateau: S(d) = m*d + c for d <= b,
         and S(d) = m*b + c for d > b, where b is the knot (breakpoint).
 
-        The fit is initialised with scipy's curve_fit and optionally refined with
-        differential evolution seeded around the curve_fit solution, to avoid
-        local minima near the knot location.
+        Fitted globally and exactly (see `_fit_piece_wise_linear`): for a fixed
+        knot b the model is linear in (m, c), and the least-squares objective
+        over b is solved in closed form on every interval between consecutive
+        distinct distances -- no dependence on a starting guess, which a
+        single local optimizer has (the knot's objective routinely has several
+        separated minima). refine_fit=False only evaluates knots at the
+        observed distances themselves.
 
         Convergence is structurally defined by the knot b: nodes with d > b are
         on the plateau and considered fully converged; nodes with d <= b are in
@@ -330,49 +461,60 @@ class PiecewiseLinearFit(Fit):
     def piecewise_plateau(d, b, m, c):
         return np.where(d <= b, m * d + c, m * b + c)
 
-    def _refine_fit(self, p_opt):
-        def residuals(params):
-            return np.sum((self.piecewise_plateau(self._d, *params) - self._S_true) ** 2)
-        
-        # Build a search region around the curve_fit solution
-        spread = np.abs(p_opt) * 0.5 + 1e-6  # 50% spread around solution, avoid zero
-        de_bounds = [
-            (max(p_opt[0] - spread[0], np.min(self._d)), min(p_opt[0] + spread[0], np.max(self._d))),  # b
-            (p_opt[1] - spread[1], p_opt[1] + spread[1]),  # m
-            (p_opt[2] - spread[2], p_opt[2] + spread[2]),  # c
-        ]
-        
-        # Seed the population around the curve_fit solution
-        rng = np.random.default_rng(42)
-        popsize = 15
-        population = p_opt + rng.uniform(-0.5, 0.5, size=(popsize, len(p_opt))) * spread
-        
-        de_result = differential_evolution(
-            residuals,
-            bounds=de_bounds,
-            init=population,
-            seed=42,
-            tol=1e-10,
-        )
-        
-        # Only accept if better (guaranteed not to be worse due to init)
-        if de_result.fun < residuals(p_opt):
-            p_opt = de_result.x
-        return p_opt
-
     def _fit_piece_wise_linear(self, refine_fit):
-        p0 = [np.median(self._d), 1.0, np.mean(self._S_true)]
-        lower_bounds = [np.min(self._d), -np.inf, -np.inf]
-        upper_bounds = [np.max(self._d), np.inf, np.inf]
-        p_opt, _ = curve_fit(self.piecewise_plateau, self._d, self._S_true, p0=p0, bounds=(lower_bounds, upper_bounds), maxfev=2000)
-        
+        """Exact global least-squares fit. For a knot b the model is linear in
+        (m, c) with regressor x = min(d, b). Between two consecutive distinct
+        distances d_k <= b < d_(k+1) the set of points left of the knot is
+        fixed, so the centred sums are sxy(b) = alpha + beta*b and
+        sxx(b) = q0 + q1*b + q2*b^2, and SSE(b) = syy - sxy^2/sxx has at most
+        one interior stationary point, b* = (alpha*q1 - 2*beta*q0) /
+        (beta*q1 - 2*alpha*q2). Evaluating every interval's endpoints (and,
+        with refine_fit=True, its b*) via cumulative sums gives the global
+        optimum over all b in [min(d), max(d)] in O(n log n) -- no starting
+        guess, no local search."""
+        d = np.asarray(self._d, dtype=float)
+        y = np.asarray(self._S_true, dtype=float)
+        order = np.argsort(d, kind="stable")
+        ds, ys = d[order], y[order]
+        n = len(ds)
+        cd, cd2, cdy, cy = (np.concatenate([[0.0], np.cumsum(v)]) for v in (ds, ds * ds, ds * ys, ys))
+        Sy, Syy = cy[-1], float(np.dot(ys, ys))
+        syy = Syy - Sy ** 2 / n
+
+        uniq = np.unique(ds)
+        if len(uniq) < 2:
+            raise RuntimeError("distances are constant -- knot not identifiable")
+        k_end = np.searchsorted(ds, uniq, side="right")  # points with d <= uniq[j]
+        # interval j: uniq[j] <= b < uniq[j+1], k = k_end[j] points left of the knot
+        k = k_end[:-1]
+        lo, hi = uniq[:-1], uniq[1:]
+        g = n - k                                    # points right of the knot (x = b)
+        A, B, C = cd[k], cd2[k], cdy[k]              # sums over the left points
+        Yg = Sy - cy[k]                              # sum of y over the right points
+        alpha, beta = C - A * Sy / n, Yg - g * Sy / n
+        q0, q1, q2 = B - A ** 2 / n, -2 * A * g / n, g - g ** 2 / n
+
+        def sse_at(bb):
+            sxx = q0 + q1 * bb + q2 * bb ** 2
+            sxy = alpha + beta * bb
+            ok = sxx > 1e-12 * np.maximum(1.0, B + g * bb ** 2)
+            return np.where(ok, syy - sxy ** 2 / np.where(ok, sxx, 1.0), np.inf)
+
+        cand_b = [lo, hi]
         if refine_fit:
-            p_opt = self._refine_fit(p_opt)
-        
-        b_opt, m_opt, c_opt = p_opt
-        C_fit = self.piecewise_plateau(self._d, b_opt, m_opt, c_opt)
+            den = beta * q1 - 2 * alpha * q2
+            with np.errstate(divide="ignore", invalid="ignore"):
+                b_star = np.where(den != 0, (alpha * q1 - 2 * beta * q0) / den, lo)
+            cand_b.append(np.clip(np.nan_to_num(b_star, nan=0.0, posinf=0.0, neginf=0.0), lo, hi))
+        sse = np.stack([sse_at(bb) for bb in cand_b])  # (n_candidates, n_intervals)
+        if not np.isfinite(sse).any():
+            raise RuntimeError("no non-degenerate knot")
+        which, j = np.unravel_index(np.argmin(sse), sse.shape)
+        b_opt = float(cand_b[which][j])
+        m_opt, c_opt, _ = _linear_solve(np.minimum(d, b_opt), y, intercept=True)
+        C_fit = self.piecewise_plateau(d, b_opt, m_opt, c_opt)
         return b_opt, m_opt, c_opt, C_fit
-    
+
     def _rate_observed_metrics(self):
         if not self._converged:
             self._observed_effect_strength = np.nan
@@ -429,8 +571,17 @@ class PiecewiseLinearFit(Fit):
             self._S_corrected = self._S_true
         return self.S_corrected # this calls the getter function of the property and extends to original index
 
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.piecewise_plateau(
+            d, self._params["piecewise_linear_b"], self._params["piecewise_linear_m"], self._params["piecewise_linear_c"]
+        )
+
 
 class ExponentialSaturationFit(Fit):
+    color = "#AB0C67"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits an exponential saturation model: S(d) = a*(1 - exp(-b*d)) + c,
@@ -456,11 +607,14 @@ class ExponentialSaturationFit(Fit):
     def exp_sat(d, a, b, c):
         return a * (1 - np.exp(-b * d)) + c
 
-    def _fit_exponential_saturation(self):
-        p0 = [max(self._S_true) - min(self._S_true), 1 / (np.mean(self._d) + 1e-6), min(self._S_true)]
-        bounds = ([-np.inf, 1e-6, -np.inf], [np.inf, np.inf, np.inf])
-        popt, _ = curve_fit(self.exp_sat, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
-        a_opt, b_opt, c_opt = popt
+    def _fit_exponential_saturation(self, maxfev=None):
+        """Global least-squares fit over the rate b (see `_profile_fit`); for
+        fixed b the model is linear in (a, c). maxfev is ignored (kept for
+        backward compatibility)."""
+        a_opt, b_opt, c_opt = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: 1 - np.exp(-b * d),
+            b_grid=_rate_grid(self._d), intercept=True,
+        )
         C_fit = self.exp_sat(self._d, a_opt, b_opt, c_opt)
         return a_opt, b_opt, c_opt, C_fit
 
@@ -525,8 +679,135 @@ class ExponentialSaturationFit(Fit):
             self._S_corrected = self._S_true
         return self.S_corrected
 
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.exp_sat(
+            d, self._params["exponential_saturation_a"], self._params["exponential_saturation_b"],
+            self._params["exponential_saturation_c"],
+        )
+
+
+class ExponentialDecayFit(Fit):
+    color = "#7B2CBF"
+
+    def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
+        """
+        Fits a pure exponential decay model: S(d) = a * exp(-b*d), which
+        asymptotes to exactly 0 as d -> infinity -- unlike
+        ExponentialSaturationFit, there is no free offset term for the
+        far-field value. Appropriate only when the far-field value is
+        actually known/expected to be zero rather than an unknown constant
+        to be estimated (e.g. fitting counts strictly outside a tissue mask,
+        restricted to a connected, n_counts>0 component -- there, the region
+        being fit is bounded exactly by where the signal already hits zero,
+        by construction of how the component was built, so forcing that
+        boundary condition is a correct constraint, not an assumption).
+
+        Parameters a, b represent amplitude (at d=0) and rate respectively.
+        b is constrained to be positive (monotonic decay, not growth).
+
+        A node is considered converged once it has decayed to within
+        `threshold` of the way from a to 0, i.e. when d >= -ln(1 - threshold) / b
+        -- the same time-constant relationship as ExponentialSaturationFit,
+        since it depends only on b, not on the (here fixed at 0) asymptote.
+
+        Parameters
+        ----------
+        S_true : pd.DataFrame | pd.Series
+            Observed signal values.
+        d : pd.DataFrame | pd.Series
+            Distance from border, aligned with S_true.
+        """
+        super().__init__(S_true, d)
+        self._name = "Exponential Decay Fit"
+
+    @staticmethod
+    def exp_decay(d, a, b):
+        return a * np.exp(-b * d)
+
+    def _fit_exponential_decay(self):
+        """Global least-squares fit over the rate b (see `_profile_fit`); for
+        fixed b the model is linear in a (no offset)."""
+        a_opt, b_opt, _ = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: np.exp(-b * d),
+            b_grid=_rate_grid(self._d), intercept=False,
+        )
+        C_fit = self.exp_decay(self._d, a_opt, b_opt)
+        return a_opt, b_opt, C_fit
+
+    def _rate_observed_metrics(self):
+        if not self._converged:
+            self._observed_effect_strength = np.nan
+            self._observed_half_life = np.nan
+            return
+        d_min = np.min(self._d)
+        d_max = np.max(self._d)
+        a, b = self.params["exponential_decay_a"], self.params["exponential_decay_b"]
+        c_border = self.exp_decay(d_min, a, b)
+        c_center = self.exp_decay(d_max, a, b)
+
+        self._observed_effect_strength = (c_border - c_center) / (c_border + c_center + _EPS)
+
+        C_mid = (c_border + c_center) / 2
+        raw_half_life = -(1 / b) * np.log(C_mid / (a + _EPS) + _EPS)
+        self._observed_half_life = raw_half_life / (d_max + _EPS)
+
+    def _calculate_fraction_not_converged(self, threshold: float = _DEFAULT_CONVERGENCE_THRESHOLD) -> float:
+        """
+        The exponential decay a*exp(-b*d) asymptotes to 0. A point is
+        considered converged once it has decayed to within `threshold` of
+        the way from a to 0, i.e. when:
+
+            a - a*exp(-b*d) >= threshold * a
+            => d >= -ln(1 - threshold) / b
+
+        Returns the fraction of observed nodes below this convergence distance.
+        """
+        if self.params is None:
+            raise ValueError("Model has not been fitted yet")
+        if not self._converged:
+            self._fraction_not_converged = np.nan
+            return self._fraction_not_converged
+        if not (0 < threshold < 1):
+            raise ValueError("threshold must be in (0, 1)")
+        b = self.params["exponential_decay_b"]
+        d_converge = -np.log(1 - threshold) / b
+        self._fraction_not_converged = float(np.mean(self._d < d_converge))
+        return self._fraction_not_converged
+
+    def fit(self):
+        try:
+            a_opt, b_opt, C_fit = self._fit_exponential_decay()
+            self._params = {"exponential_decay_a": a_opt, "exponential_decay_b": b_opt}
+            self._S_model = C_fit
+            self._converged = True
+        except (RuntimeError, ValueError):
+            self._converged = False
+            self._params = {"exponential_decay_a": np.nan, "exponential_decay_b": np.nan}
+            self._S_model = self._S_true
+
+        self._finalize_fit()
+
+    def correct(self):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before correct()")
+        if self._converged:
+            # asymptote is 0, so "S_true + asymptote - S_model" simplifies to S_true - S_model
+            self._S_corrected = self._S_true - self.S_model
+        else:
+            self._S_corrected = self._S_true
+        return self.S_corrected
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.exp_decay(d, self._params["exponential_decay_a"], self._params["exponential_decay_b"])
+
 
 class MichaelisMentenFit(Fit):
+    color = "#FFCC00"
+
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
         Fits a Michaelis-Menten (hyperbolic saturation) model: S(d) = a*d/(b+d) + c,
@@ -554,10 +835,12 @@ class MichaelisMentenFit(Fit):
         return a * d / (b + d) + c
 
     def _fit_michaelis_menten(self):
-        p0 = [np.max(self._S_true) - np.min(self._S_true), np.median(self._d), np.min(self._S_true)]
-        bounds = ([-np.inf, 1e-6, -np.inf], [np.inf, np.inf, np.inf])
-        popt, _ = curve_fit(self.michaelis_menten, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
-        a_opt, b_opt, c_opt = popt
+        """Global least-squares fit over the half-saturation distance b (see
+        `_profile_fit`); for fixed b the model is linear in (a, c)."""
+        a_opt, b_opt, c_opt = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: d / (b + d),
+            b_grid=_scale_grid(self._d), intercept=True,
+        )
         C_fit = self.michaelis_menten(self._d, a_opt, b_opt, c_opt)
         return a_opt, b_opt, c_opt, C_fit
 
@@ -625,4 +908,11 @@ class MichaelisMentenFit(Fit):
         else:
             self._S_corrected = self._S_true
         return self.S_corrected
-    
+
+    def predict(self, d):
+        if self._params is None:
+            raise RuntimeError("fit() must be called before predict()")
+        return self.michaelis_menten(
+            d, self._params["michaelis_menten_a"], self._params["michaelis_menten_b"], self._params["michaelis_menten_c"]
+        )
+

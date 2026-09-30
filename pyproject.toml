@@ -17,7 +17,8 @@ dependencies = ["scikit-learn",
                 "scipy",
                 "numpy",
                 "pandas",
-                "networkx"]
+                "networkx",
+                "matplotlib"]
 
 [project.optional-dependencies]
 dev = ["pytest"]
@@ -25,6 +26,7 @@ graph = ["graph-tool"] # this will fail, only to document intent
 alphashape = ["alphashape", "shapely"]
 anndata = ["anndata"]
 image-masks = ["scikit-image", "anndata"]
+raw = ["anndata", "h5py", "pyarrow", "tifffile", "scikit-image"]
 
 [project.urls]
 Homepage = "https://github.com/bionetslab/bosperrus-package"

@@ -16,9 +16,11 @@ import pandas as pd
 import pytest
 
 from bosperrus.fit import (
+    Fit,
     ConstantFit,
     PiecewiseLinearFit,
     ExponentialSaturationFit,
+    ExponentialDecayFit,
     MichaelisMentenFit,
 )
 
@@ -322,6 +324,119 @@ class TestExponentialSaturationFit:
 
 
 # ============================================================
+# ExponentialDecayFit
+# ============================================================
+
+class TestExponentialDecayFit:
+    def _ground_truth(self, a=3.0, b=0.5, noise=0.0):
+        C = ExponentialDecayFit.exp_decay(D, a, b)
+        C = C + RNG.normal(0, noise, N)
+        return make_series(C), make_series(D)
+
+    def _fit(self, C, d):
+        f = ExponentialDecayFit(C, d)
+        f.fit()
+        return f
+
+    def test_fit_runs_and_sets_attributes(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        assert f.params is not None
+        assert f.AIC < np.inf
+
+    def test_recovers_known_parameters(self):
+        a_true, b_true = 4.0, 0.3
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.01)
+        f = self._fit(C, d)
+        assert f.params["exponential_decay_a"] == pytest.approx(a_true, rel=0.05)
+        assert f.params["exponential_decay_b"] == pytest.approx(b_true, rel=0.05)
+
+    def test_asymptotes_to_zero_not_an_offset(self):
+        """Unlike ExponentialSaturationFit, there's no c -- predict() at a
+        large d must be close to 0, not some other floor."""
+        a_true, b_true = 4.0, 0.5
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.01)
+        f = self._fit(C, d)
+        assert f.predict(np.array([50.0]))[0] == pytest.approx(0.0, abs=1e-3)
+
+    def test_b_is_positive(self):
+        C, d = self._ground_truth(noise=0.2)
+        f = self._fit(C, d)
+        assert f.params["exponential_decay_b"] > 0
+
+    def test_convergence_distance_analytically_correct(self):
+        # At d_converge = -ln(1 - threshold) / b, exactly (1 - threshold) of a remains
+        a, b = 5.0, 0.4
+        C, d = self._ground_truth(a=a, b=b, noise=0.0)
+        f = self._fit(C, d)
+        threshold = 0.95
+        d_converge = -np.log(1 - threshold) / f.params["exponential_decay_b"]
+        value_at_d_converge = ExponentialDecayFit.exp_decay(
+            d_converge, f.params["exponential_decay_a"], f.params["exponential_decay_b"]
+        )
+        remaining_fraction = value_at_d_converge / f.params["exponential_decay_a"]
+        assert remaining_fraction == pytest.approx(1 - threshold, rel=1e-4)
+
+    def test_fraction_not_converged_in_01(self):
+        C, d = self._ground_truth(noise=0.05)
+        f = self._fit(C, d)
+        assert 0.0 <= f.fraction_not_converged <= 1.0
+
+    def test_fraction_not_converged_invalid_threshold(self):
+        C, d = self._ground_truth()
+        f = ExponentialDecayFit(C, d)
+        with pytest.raises(ValueError):
+            f._calculate_fraction_not_converged(threshold=1.5)
+        with pytest.raises(ValueError):
+            f._calculate_fraction_not_converged(threshold=0.0)
+
+    def test_fraction_not_converged_before_fit_is_none(self):
+        C, d = self._ground_truth()
+        f = ExponentialDecayFit(C, d)
+        assert f.fraction_not_converged is None
+
+    def test_effect_strength_positive_for_decaying_data(self):
+        # a > 0 -> S decreases from a (near d=0) toward 0 -> border > center -> positive
+        C, d = self._ground_truth(a=3.0, b=0.5)
+        f = self._fit(C, d)
+        assert f.observed_effect_strength > 0
+
+    def test_half_life_positive(self):
+        C, d = self._ground_truth(a=3.0, b=0.5)
+        f = self._fit(C, d)
+        assert f.observed_half_life > 0
+
+    def test_aic_better_than_constant_on_decaying_data(self):
+        C, d = self._ground_truth(a=4.0, b=0.4, noise=0.05)
+        const_f = ConstantFit(C, d)
+        const_f.fit()
+        decay_f = self._fit(C, d)
+        assert decay_f.AIC < const_f.AIC
+
+    def test_correct_shifts_toward_zero_not_an_offset(self):
+        a_true, b_true = 4.0, 0.5
+        C, d = self._ground_truth(a=a_true, b=b_true, noise=0.1)
+        f = self._fit(C, d)
+        corrected = f.correct()
+        np.testing.assert_allclose(corrected, f._S_true - f.S_model)
+
+    def test_attributes_are_immutable(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        with pytest.raises(AttributeError):
+            f.params = {"exponential_decay_a": 999}
+        with pytest.raises(AttributeError):
+            f.S_model = np.zeros(N)
+
+    def test_repr_smoke(self):
+        C, d = self._ground_truth()
+        f = self._fit(C, d)
+        r = repr(f)
+        assert "ExponentialDecayFit" in r
+        assert "converged" in r
+
+
+# ============================================================
 # MichaelisMentenFit
 # ============================================================
 
@@ -444,11 +559,29 @@ class TestMichaelisMentenFit:
 
 class TestCrossModel:
 
+    def test_each_subclass_has_its_own_color(self):
+        """color is a class attribute, readable without instantiating, and
+        distinct per subclass -- the whole point is that a live Fit
+        instance (fit.color) or the bare class (ConstantFit.color) both
+        expose it directly, no separate lookup table needed."""
+        classes = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]
+        for cls in classes:
+            assert cls.color != Fit.color  # every concrete subclass overrides the base default
+        colors = [cls.color for cls in classes]
+        assert len(set(colors)) == len(colors)  # all distinct
+
+    def test_instance_color_matches_class_color(self):
+        C = make_series(np.ones(N))
+        d = make_series(D)
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
+            f = cls(C, d)
+            assert f.color == cls.color
+
     def test_constant_data_favors_constant_fit(self):
         C = make_series(np.full(N, 3.0))
         d = make_series(D)
         fits = [ConstantFit(C, d), PiecewiseLinearFit(C, d),
-                ExponentialSaturationFit(C, d), MichaelisMentenFit(C, d)]
+                ExponentialSaturationFit(C, d), ExponentialDecayFit(C, d), MichaelisMentenFit(C, d)]
         for f in fits:
             f.fit()
         best = min(fits, key=lambda f: f.AIC)
@@ -457,7 +590,7 @@ class TestCrossModel:
     def test_all_models_have_finite_aic(self):
         C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0) + RNG.normal(0, 0.1, N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             f.fit()
             assert np.isfinite(f.AIC), f"{cls.__name__} produced non-finite AIC"
@@ -465,7 +598,7 @@ class TestCrossModel:
     def test_included_samples_is_one_without_nans(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             assert f.included_samples == pytest.approx(1.0)
 
@@ -481,7 +614,7 @@ class TestCrossModel:
     def test_correct_raises_before_fit(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             with pytest.raises(RuntimeError):
                 f.correct()
@@ -495,7 +628,7 @@ class TestCrossModel:
     def test_all_attributes_immutable_across_models(self):
         C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             f.fit()
             with pytest.raises(AttributeError):
@@ -504,11 +637,42 @@ class TestCrossModel:
     def test_repr_before_fit(self):
         C = make_series(np.ones(N))
         d = make_series(D)
-        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]:
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
             f = cls(C, d)
             r = repr(f)
             assert cls.__name__ in r
             assert "not fitted" in r
+
+    def test_predict_matches_model_formula(self):
+        """predict() must agree exactly with each subclass's own static model
+        formula evaluated at the fitted params -- the whole point of a
+        uniform predict() is that callers don't need to know which formula
+        to call by hand."""
+        C = make_series(ExponentialSaturationFit.exp_sat(D, 3.0, 0.4, 1.0) + RNG.normal(0, 0.05, N))
+        d = make_series(D)
+        d_new = np.linspace(0, 20, 50)  # extrapolates past the training range
+        cases = [
+            (ConstantFit, lambda f, x: np.full_like(x, f.params["constant_c"], dtype=float)),
+            (PiecewiseLinearFit, lambda f, x: PiecewiseLinearFit.piecewise_plateau(
+                x, f.params["piecewise_linear_b"], f.params["piecewise_linear_m"], f.params["piecewise_linear_c"])),
+            (ExponentialSaturationFit, lambda f, x: ExponentialSaturationFit.exp_sat(
+                x, f.params["exponential_saturation_a"], f.params["exponential_saturation_b"],
+                f.params["exponential_saturation_c"])),
+            (MichaelisMentenFit, lambda f, x: MichaelisMentenFit.michaelis_menten(
+                x, f.params["michaelis_menten_a"], f.params["michaelis_menten_b"], f.params["michaelis_menten_c"])),
+        ]
+        for cls, expected_formula in cases:
+            f = cls(C, d)
+            f.fit()
+            np.testing.assert_allclose(f.predict(d_new), expected_formula(f, d_new))
+
+    def test_predict_raises_before_fit(self):
+        C = make_series(np.ones(N))
+        d = make_series(D)
+        for cls in [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit]:
+            f = cls(C, d)
+            with pytest.raises(RuntimeError):
+                f.predict(D)
 
 
 # ============================================================
@@ -669,3 +833,78 @@ class TestFitCorrectPassthrough:
         np.testing.assert_allclose(result_vals, original_vals, err_msg=(
             "correct() passthrough should return S_true unchanged when not converged"
         ))
+
+
+# ---------------------------------------------------------------------------
+# Global optimum: every model is linear given its one nonlinear parameter b,
+# and the fit must find the best b even when SSE(b) has several separated
+# minima (which a single-start local optimizer cannot guarantee).
+# ---------------------------------------------------------------------------
+
+def _two_scale_data(kind, n=6000, seed=0):
+    rng = np.random.default_rng(seed)
+    d = rng.uniform(0, 200, n)
+    if kind == "pwl":   # sharp step at ~3 plus a slow ramp to ~120: two separated knot optima
+        y = PiecewiseLinearFit.piecewise_plateau(d, 3.0, 4.0, 0.0) + PiecewiseLinearFit.piecewise_plateau(d, 120.0, 0.05, 0.0)
+    elif kind == "sat":  # fast + slow saturation
+        y = 5 * (1 - np.exp(-d / 2)) + 4 * (1 - np.exp(-d / 60))
+    elif kind == "decay":
+        y = 5 * np.exp(-d / 2) + 4 * np.exp(-d / 60)
+    return d, y + rng.normal(0, 0.3, n)
+
+
+def _brute_force_sse(d, y, basis, b_values, intercept=True):
+    best = np.inf
+    for b in b_values:
+        x = basis(d, b)
+        X = np.column_stack([x, np.ones_like(x)]) if intercept else x[:, None]
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        best = min(best, float(np.sum((X @ coef - y) ** 2)))
+    return best
+
+
+@pytest.mark.parametrize("cls,kind,basis,b_values,intercept", [
+    (PiecewiseLinearFit, "pwl", lambda d, b: np.minimum(d, b), np.linspace(0.05, 200, 8000), True),
+    (ExponentialSaturationFit, "sat", lambda d, b: 1 - np.exp(-b * d), np.logspace(-5, 2, 4000), True),
+    (MichaelisMentenFit, "sat", lambda d, b: d / (b + d), np.logspace(-3, 6, 4000), True),
+    (ExponentialDecayFit, "decay", lambda d, b: np.exp(-b * d), np.logspace(-5, 2, 4000), False),
+])
+def test_fit_reaches_global_least_squares_optimum(cls, kind, basis, b_values, intercept):
+    d, y = _two_scale_data(kind)
+    fit = cls(pd.Series(y), pd.Series(d))
+    fit.fit()
+    assert fit._converged
+    sse_fit = float(np.sum((fit.predict(d) - y) ** 2))
+    sse_brute = _brute_force_sse(d, y, basis, b_values, intercept)
+    assert sse_fit <= sse_brute * (1 + 1e-6)
+
+
+def test_piecewise_fit_does_not_depend_on_median_start():
+    """Regression for the single-start failure: a large step at d~3 (the
+    global least-squares knot) plus a small ramp just below the median
+    distance, which creates a second, worse local optimum at b~100. The old
+    fit (curve_fit started at b = median(d)) returned b~105-112 here for
+    every seed tried; the global scan must find b~3."""
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        d = rng.uniform(0, 200, 5000)
+        y = (PiecewiseLinearFit.piecewise_plateau(d, 3.0, 5.0, 0.0)
+             + np.clip((d - 80) / 20, 0, 1) + rng.normal(0, 0.5, len(d)))
+        fit = PiecewiseLinearFit(pd.Series(y), pd.Series(d))
+        fit.fit()
+        assert fit.params["piecewise_linear_b"] == pytest.approx(3.0, abs=0.5)
+
+
+def test_piecewise_fit_is_exact_between_discrete_distances():
+    """Grid distances take few distinct values; the least-squares knot can lie
+    strictly between two of them. The closed-form interval solve must match a
+    very dense brute-force scan over b."""
+    rng = np.random.default_rng(1)
+    d = rng.integers(0, 21, 4000).astype(float)
+    y = PiecewiseLinearFit.piecewise_plateau(d, 5.5, 2.0, 1.0) + rng.normal(0, 0.5, len(d))
+    fit = PiecewiseLinearFit(pd.Series(y), pd.Series(d))
+    fit.fit()
+    sse_fit = float(np.sum((fit.predict(d) - y) ** 2))
+    sse_brute = _brute_force_sse(d, y, lambda dd, b: np.minimum(dd, b), np.linspace(0, 20, 20001))
+    assert sse_fit <= sse_brute * (1 + 1e-9)
+    assert 5.0 < fit.params["piecewise_linear_b"] < 6.0

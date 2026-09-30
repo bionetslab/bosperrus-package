@@ -11,12 +11,13 @@ presence in `bosperrus.__all__` -- stays importable without them installed.
 readers embed an image directly in the AnnData -- e.g. 10x Visium. Platforms
 that ship tissue images/masks as separate files with their own project-
 specific naming convention (e.g. STOmics/Stereo-seq) aren't covered here;
-that loading logic is inherently tied to one project's file layout, not a
-general AnnData convention, so it belongs with that project's own code.
+`segment_tissue_from_ssdna` segments those images once loaded (see
+`anndata_api.quantify_diffusion_from_raw`, which finds them in a SAW output
+folder).
 """
 import numpy as np
 
-__all__ = ["get_hires_image", "segment_tissue_from_rgb", "get_tissue_mask"]
+__all__ = ["get_hires_image", "segment_tissue_from_rgb", "segment_tissue_from_ssdna", "get_tissue_mask"]
 
 
 def _require_skimage():
@@ -43,6 +44,13 @@ def get_hires_image(adata, library_id, image_key="hires"):
     """Extract an AnnData's own embedded image and its pixel scale factor
     (scanpy/squidpy convention: `adata.uns["spatial"][library_id]`).
 
+    Only works for platforms whose reader embeds an image directly in the
+    AnnData this way -- e.g. 10x Visium. Platforms that ship tissue
+    images/masks as separate files instead (e.g. STOmics/Stereo-seq) have
+    no `adata.uns["spatial"]` at all and will raise a `KeyError` here --
+    `anndata_api.quantify_diffusion_from_raw` reads those images straight
+    from each pipeline's own output folder instead.
+
     Parameters
     ----------
     adata : AnnData
@@ -63,7 +71,25 @@ def get_hires_image(adata, library_id, image_key="hires"):
         following this convention use to align spots to a non-fullres image.
     """
     _require_anndata()
+    if "spatial" not in adata.uns:
+        raise KeyError(
+            "adata.uns['spatial'] not found. get_hires_image/get_tissue_mask only work for platforms "
+            "whose reader embeds an image directly in the AnnData (the scanpy/squidpy convention, e.g. "
+            "10x Visium). If this sample stores its tissue mask/image as a separate file instead (e.g. "
+            "STOmics/Stereo-seq), use anndata_api.quantify_diffusion_from_raw, which reads the "
+            "image straight from the pipeline's output folder."
+        )
+    if library_id not in adata.uns["spatial"]:
+        raise KeyError(
+            f"library_id={library_id!r} not found in adata.uns['spatial']. "
+            f"Available: {list(adata.uns['spatial'])}."
+        )
     spatial_meta = adata.uns["spatial"][library_id]
+    if image_key not in spatial_meta["images"]:
+        raise KeyError(
+            f"image_key={image_key!r} not found in adata.uns['spatial'][{library_id!r}]['images']. "
+            f"Available: {list(spatial_meta['images'])}."
+        )
     image = spatial_meta["images"][image_key]
     pixel_scale = float(spatial_meta["scalefactors"][f"tissue_{image_key}_scalef"])
     return image, pixel_scale
@@ -118,6 +144,67 @@ def segment_tissue_from_rgb(image, sigma=8, close_radius=10, min_hole_area=50000
     mask = remove_small_holes(mask, area_threshold=min_hole_area)
     mask = remove_small_objects(mask, min_size=min_object_area)
     return mask
+
+
+def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_radius=6, fill_holes=True):
+    """Tissue-vs-background segmentation for a single-channel fluorescence
+    nucleic-acid stain (e.g. STOmics/Stereo-seq's `*_ssDNA_regist.tif`):
+    block-mean downscale -> global threshold (tissue is *brighter* than the
+    background here, unlike H&E) -> morphological closing -> hole filling.
+
+    Segmentation runs on the downscaled image only -- a native ssDNA image is
+    ~23k x 23k pixels, far too large (and far too textured) to threshold
+    usefully at native resolution. The returned mask stays at that
+    downscaled resolution; `factor` maps it back (native pixel `(r, c)` lies
+    in mask pixel `(r // factor, c // factor)`).
+
+    Parameters
+    ----------
+    image : np.ndarray
+        2D grayscale image.
+    threshold : {"otsu", "multiotsu_top"}, default "otsu"
+        "otsu": single Otsu threshold. "multiotsu_top": 3-class multi-Otsu,
+        keeping only the brightest class -- for images where a dim middle
+        class is background (e.g. uneven/bright chip background) rather than
+        tissue.
+    target_size : int, default 2000
+        Approximate long-edge size (pixels) of the downscaled working image;
+        the downscale factor is `max(1, round(max(image.shape) / target_size))`.
+    close_radius : int, default 6
+        Radius (downscaled pixels) of the morphological closing disk.
+    fill_holes : bool, default True
+        Fill enclosed holes after closing.
+
+    Returns
+    -------
+    mask : np.ndarray of bool
+        Tissue mask at the downscaled resolution.
+    factor : int
+        Integer downscale factor (native pixels per mask pixel, per axis).
+    """
+    _require_skimage()
+    from scipy.ndimage import binary_fill_holes
+    from skimage.filters import threshold_multiotsu, threshold_otsu
+    from skimage.morphology import binary_closing, disk
+    from skimage.transform import downscale_local_mean
+
+    image = np.asarray(image)
+    if image.ndim != 2:
+        raise ValueError(f"Expected a 2D grayscale image, got shape {image.shape}.")
+    factor = max(1, int(round(max(image.shape) / target_size)))
+    small = downscale_local_mean(image, (factor, factor)).astype(float)
+
+    if threshold == "otsu":
+        mask = small > threshold_otsu(small)
+    elif threshold == "multiotsu_top":
+        mask = small > threshold_multiotsu(small, classes=3)[-1]
+    else:
+        raise ValueError(f"threshold must be 'otsu' or 'multiotsu_top', got {threshold!r}.")
+
+    mask = binary_closing(mask, disk(close_radius))
+    if fill_holes:
+        mask = binary_fill_holes(mask)
+    return mask, factor
 
 
 def get_tissue_mask(adata, library_id, image_key="hires", **segment_kwargs):

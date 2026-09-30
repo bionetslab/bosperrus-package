@@ -403,3 +403,54 @@ def test_grid_neighbor_graph_reused_matches_default_hex(hex_grid_rowcol):
     border_reused = find_grid_border(row, col, grid_type="hex", neighbor_graph=neighbor_graph)
     border_default = find_grid_border(row, col, grid_type="hex")
     np.testing.assert_array_equal(border_reused, border_default)
+
+
+# ---------------------------------------------------------------------------
+# small_grid_holes
+# ---------------------------------------------------------------------------
+
+def _square_with_holes(n=20, holes=()):
+    """n x n rect grid of nodes; positions in `holes` get n_counts 0."""
+    from bosperrus.graph_construction import small_grid_holes  # noqa: F401
+    rows, cols = np.meshgrid(np.arange(n), np.arange(n), indexing="ij")
+    row, col = rows.ravel(), cols.ravel()
+    n_counts = np.ones(len(row))
+    for r, c in holes:
+        n_counts[(row == r) & (col == c)] = 0
+    return row, col, n_counts
+
+
+def test_small_grid_holes_reports_small_enclosed_holes_only():
+    from bosperrus.graph_construction import small_grid_holes
+    big = [(r, c) for r in range(10, 16) for c in range(10, 16)]  # 36 positions
+    row, col, n_counts = _square_with_holes(holes=[(3, 3)] + big)
+    hr, hc = small_grid_holes(row, col, n_counts, max_hole_size=16)
+    assert set(zip(hr, hc)) == {(3, 3)}
+    hr, hc = small_grid_holes(row, col, n_counts, max_hole_size=36)
+    assert set(zip(hr, hc)) == {(3, 3)} | set(big)
+
+
+def test_small_grid_holes_ignores_gaps_open_to_the_outside():
+    from bosperrus.graph_construction import small_grid_holes
+    row, col, n_counts = _square_with_holes(holes=[(0, 5), (1, 5)])  # notch in the top edge
+    hr, _ = small_grid_holes(row, col, n_counts, max_hole_size=16)
+    assert len(hr) == 0
+
+
+def test_small_grid_holes_diagonal_only_opening_counts_as_enclosed():
+    """Hole positions connect through shared sides only: an empty position
+    touching the outside only via a corner is still enclosed."""
+    from bosperrus.graph_construction import small_grid_holes
+    row, col, n_counts = _square_with_holes(n=5, holes=[(1, 1)])
+    keep = ~((row == 0) & (col == 0))  # remove the corner node -> (1, 1) touches outside diagonally
+    hr, hc = small_grid_holes(row[keep], col[keep], n_counts[keep], max_hole_size=16)
+    assert set(zip(hr, hc)) == {(1, 1)}
+
+
+def test_small_grid_holes_includes_positions_without_nodes():
+    from bosperrus.graph_construction import small_grid_holes
+    row, col, n_counts = _square_with_holes()
+    keep = ~((row == 7) & (col == 8))  # no node at all at (7, 8)
+    hr, hc = small_grid_holes(row[keep], col[keep], n_counts[keep], max_hole_size=16)
+    assert set(zip(hr, hc)) == {(7, 8)}
+

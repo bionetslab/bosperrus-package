@@ -7,7 +7,7 @@ from sklearn.neighbors import NearestNeighbors
 
 __all__ = ['construct_graph', 'knn_edges', 'rnn_edges', 'delaunay_edges', 'grid_edges',
            'grid_to_physical_coords', 'grid_neighbor_graph',
-           'split_into_connected_components', 'find_grid_border']
+           'split_into_connected_components', 'find_grid_border', 'small_grid_holes']
 
 _GRID_NEIGHBOR_OFFSETS = {
     "hex": [(0, -2), (0, 2), (-1, -1), (-1, 1), (1, -1), (1, 1)],
@@ -324,3 +324,58 @@ def find_grid_border(row, col, n_counts=None, grid_type="rect", neighbor_graph=N
     max_degree = len(_GRID_NEIGHBOR_OFFSETS[grid_type])
     is_border[kept_idx] = degree < max_degree
     return is_border
+
+
+def small_grid_holes(row, col, n_counts=None, max_hole_size=16):
+    """Grid positions inside small enclosed holes of a square ("rect") grid
+    footprint -- e.g. single empty 8um bins inside otherwise continuous
+    tissue, which would otherwise each become a ring of spurious internal
+    border nodes (see `find_grid_border`).
+
+    The footprint is every node with `n_counts > 0` (every node if `n_counts`
+    is None). A hole is a connected region of grid positions outside the
+    footprint that is fully enclosed by it; hole positions connect only
+    through shared sides (4-connectivity), so a gap that reaches the outside
+    only diagonally still counts as enclosed. Holes with more than
+    `max_hole_size` positions (real gaps: vessels, lumens, tears) are left
+    alone.
+
+    Parameters
+    ----------
+    row, col : array-like of int
+        Grid indices, one pair per node.
+    n_counts : array-like, optional
+        Per-node counts; nodes with `n_counts <= 0` are not part of the
+        footprint (and can therefore lie inside a hole).
+    max_hole_size : int, default 16
+        Largest hole (number of grid positions) that is reported.
+
+    Returns
+    -------
+    hole_row, hole_col : np.ndarray of int
+        Every grid position inside a reported hole -- whether or not a node
+        exists there (a node with `n_counts <= 0`, or no node at all).
+    """
+    from scipy import ndimage
+
+    row, col, keep = _validate_grid_inputs(row, col, n_counts)
+    row = row.astype(np.int64)
+    col = col.astype(np.int64)
+    if not keep.any():
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    r0, c0 = row[keep].min() - 1, col[keep].min() - 1
+    shape = (row[keep].max() - r0 + 2, col[keep].max() - c0 + 2)
+    footprint = np.zeros(shape, dtype=bool)
+    footprint[row[keep] - r0, col[keep] - c0] = True
+
+    cross = ndimage.generate_binary_structure(2, 1)
+    holes = ndimage.binary_fill_holes(footprint, structure=cross) & ~footprint
+    labels, n_holes = ndimage.label(holes, structure=cross)
+    if n_holes == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+    sizes = np.bincount(labels.ravel())
+    small = sizes <= max_hole_size
+    small[0] = False
+    hole_r, hole_c = np.nonzero(small[labels])
+    return hole_r + r0, hole_c + c0
+
