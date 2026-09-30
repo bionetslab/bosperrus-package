@@ -33,7 +33,7 @@ FIT_PALETTE = {
 }
 
 
-def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=40,
+def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=100,
              hist_kwargs=None, line_kwargs=None):
     """2D histogram of `score` vs. `distance`, with a fitted model curve
     overlaid on top.

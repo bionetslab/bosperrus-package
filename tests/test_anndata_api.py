@@ -8,7 +8,7 @@ import pytest
 anndata = pytest.importorskip("anndata", reason="anndata not installed")
 
 from bosperrus.anndata_api import (
-    identify_analysis_buffer, correct_layer, quantify_diffusion, plot_border_effect, plot_diffusion,
+    identify_analysis_buffer_from_filtered, correct_layer, plot_border_effect,
 )
 from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit
 
@@ -23,7 +23,8 @@ def _rect_grid_adata(n_side=10):
     n = len(row)
     adata = anndata.AnnData(
         X=np.zeros((n, 2)),
-        obs=pd.DataFrame({"array_row": row, "array_col": col}, index=[f"spot_{i}" for i in range(n)]),
+        obs=pd.DataFrame({"array_row": row, "array_col": col, "n_counts": np.ones(n)},
+                         index=[f"spot_{i}" for i in range(n)]),
         var=pd.DataFrame(index=["gene_a", "gene_b"]),
     )
     return adata, row, col
@@ -40,7 +41,8 @@ def _two_block_adata(n_side=30, gap=50):
     n = len(row)
     adata = anndata.AnnData(
         X=np.zeros((n, 2)),
-        obs=pd.DataFrame({"array_row": row, "array_col": col}, index=[f"spot_{i}" for i in range(n)]),
+        obs=pd.DataFrame({"array_row": row, "array_col": col, "n_counts": np.ones(n)},
+                         index=[f"spot_{i}" for i in range(n)]),
         var=pd.DataFrame(index=["gene_a", "gene_b"]),
     )
     block_a_mask = np.arange(n) < n_side * n_side
@@ -57,7 +59,7 @@ def _distance_to_nearest_edge(row, col, n_side, row_offset=0):
 
 
 # ---------------------------------------------------------------------------
-# identify_analysis_buffer
+# identify_analysis_buffer_from_filtered
 # ---------------------------------------------------------------------------
 
 def test_identify_analysis_buffer_no_effect_flags_nothing():
@@ -66,7 +68,7 @@ def test_identify_analysis_buffer_no_effect_flags_nothing():
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     assert "analysis_buffer" in adata.obs
     assert adata.obs["analysis_buffer"].dtype == bool
@@ -90,11 +92,11 @@ def test_identify_analysis_buffer_detects_known_elbow():
     n_side = 30
     adata, row, col = _rect_grid_adata(n_side)
     d_true = _distance_to_nearest_edge(row, col, n_side)
-    b_true, m_true, c_true = 5.0, -1.0, 10.0
+    b_true, m_true, c_true = 5.0, 1.0, 5.0  # depressed at the border, rising into the tissue
     signal = PiecewiseLinearFit.piecewise_plateau(d_true, b_true, m_true, c_true)
     adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     fit_info = adata.uns["analysis_buffer_fit"]["per_component"][0]
     assert fit_info["best_fit_type"] == "Piecewise Linear Fit"
@@ -113,7 +115,7 @@ def test_identify_analysis_buffer_array_score():
     adata, row, col = _rect_grid_adata()
     values = RNG.normal(5.0, 0.1, size=len(row))
 
-    identify_analysis_buffer(adata, score=values, grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score=values, grid_type="rect")
     assert "analysis_buffer" in adata.obs
 
 
@@ -122,7 +124,7 @@ def test_identify_analysis_buffer_copy_does_not_mutate_original():
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
 
-    result = identify_analysis_buffer(adata, score="score", grid_type="rect", copy=True)
+    result = identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", copy=True)
     assert result is not None
     assert "analysis_buffer" not in adata.obs
     assert "analysis_buffer" in result.obs
@@ -139,11 +141,11 @@ def test_identify_analysis_buffer_distance_key_overrides_computed_distance():
     fake_distance = RNG.uniform(0, 20, size=len(row))  # unrelated to the real grid geometry
     adata.obs["my_distance"] = fake_distance
 
-    b_true, m_true, c_true = 8.0, -1.0, 10.0
+    b_true, m_true, c_true = 8.0, 1.0, 5.0  # depressed at the border, rising into the tissue
     signal = PiecewiseLinearFit.piecewise_plateau(fake_distance, b_true, m_true, c_true)
     adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_distance")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", distance_key="my_distance")
 
     fit_info = adata.uns["analysis_buffer_fit"]["per_component"][0]
     assert fit_info["best_fit_type"] == "Piecewise Linear Fit"
@@ -162,10 +164,29 @@ def test_identify_analysis_buffer_new_distance_key_gets_computed_and_written():
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
     assert "my_new_distance" not in adata.obs
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_new_distance")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", distance_key="my_new_distance")
 
     assert "my_new_distance" in adata.obs
     assert (adata.obs["my_new_distance"] >= 0).all()
+
+
+def test_identify_analysis_buffer_recomputes_distance_when_bin_size_um_changes():
+    """A distance_key column bosperrus itself computed before must not be
+    silently reused once bin_size_um changes -- distance_to_grid_border
+    scales directly with it, so reusing the old column would silently
+    report distances in the wrong physical units."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", bin_size_um=1.0)
+    first_distance = adata.obs["distance_to_border"].to_numpy().copy()
+
+    with pytest.warns(UserWarning, match="different parameters"):
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", bin_size_um=8.0)
+
+    second_distance = adata.obs["distance_to_border"].to_numpy()
+    np.testing.assert_allclose(second_distance, first_distance * 8.0)
 
 
 def test_identify_analysis_buffer_writes_components_and_distance_by_default():
@@ -176,7 +197,7 @@ def test_identify_analysis_buffer_writes_components_and_distance_by_default():
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     assert "components" in adata.obs
     assert "distance_to_border" in adata.obs
@@ -196,7 +217,7 @@ def test_identify_analysis_buffer_components_key_reuses_existing_column():
     fake_components = np.where(col < n_side // 2, 0, 1)
     adata.obs["my_components"] = fake_components
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", components_key="my_components")
 
     per_component = adata.uns["analysis_buffer_fit"]["per_component"]
     assert set(per_component) == {0, 1}
@@ -214,11 +235,47 @@ def test_identify_analysis_buffer_normalizes_reused_components_key_dtype():
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
     adata.obs["components"] = np.zeros(len(row), dtype=int).astype(str)
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     stored = adata.obs["components"].to_numpy()
     assert np.issubdtype(stored.dtype, np.integer)
     assert (stored == 0).all()
+
+
+def test_identify_analysis_buffer_recomputes_components_when_params_change():
+    """A components_key column bosperrus itself computed before must not be
+    silently reused once the parameters behind it change (here: adding
+    n_counts_key after a call with n_counts_key=None, which excludes some
+    spots that were previously kept) --
+    warns and recomputes instead of trusting a now-stale column."""
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs["n_counts"] = np.where(col < 5, 0, 1)  # excludes the leftmost 5 columns' spots
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", n_counts_key=None)
+    first_n_spots = sum(info["n_spots"] for info in adata.uns["analysis_buffer_fit"]["per_component"].values())
+    assert first_n_spots == len(row)  # no n_counts filtering yet -- everything kept
+
+    with pytest.warns(UserWarning, match="different parameters"):
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", n_counts_key="n_counts")
+
+    second_n_spots = sum(info["n_spots"] for info in adata.uns["analysis_buffer_fit"]["per_component"].values())
+    assert second_n_spots < first_n_spots
+
+
+def test_identify_analysis_buffer_reuses_components_silently_when_params_match():
+    """Calling twice with IDENTICAL parameters must not warn -- only an
+    actual parameter change should trigger the stale-column guard."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
 
 def test_identify_analysis_buffer_non_numeric_components_key_raises_clear_error():
@@ -228,7 +285,7 @@ def test_identify_analysis_buffer_non_numeric_components_key_raises_clear_error(
     adata.obs["my_components"] = [f"core_{i}" for i in range(len(row))]
 
     with pytest.raises(ValueError, match="isn't usable as integer component labels"):
-        identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", components_key="my_components")
 
 
 def test_identify_analysis_buffer_non_numeric_distance_key_raises_clear_error():
@@ -238,7 +295,7 @@ def test_identify_analysis_buffer_non_numeric_distance_key_raises_clear_error():
     adata.obs["my_distance"] = [f"far_{i}" for i in range(len(row))]
 
     with pytest.raises(ValueError, match="must be numeric"):
-        identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_distance")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", distance_key="my_distance")
 
 
 def test_identify_analysis_buffer_negative_distance_key_raises_clear_error():
@@ -250,7 +307,7 @@ def test_identify_analysis_buffer_negative_distance_key_raises_clear_error():
     adata.obs["my_distance"] = fake_distance
 
     with pytest.raises(ValueError, match="contains negative values"):
-        identify_analysis_buffer(adata, score="score", grid_type="rect", distance_key="my_distance")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", distance_key="my_distance")
 
 
 def test_identify_analysis_buffer_warns_on_unreasonably_many_components():
@@ -262,7 +319,7 @@ def test_identify_analysis_buffer_warns_on_unreasonably_many_components():
     adata.obs["my_components"] = np.arange(len(row))  # every spot its own "component"
 
     with pytest.warns(UserWarning, match="unusually fragmented"):
-        identify_analysis_buffer(adata, score="score", grid_type="rect", components_key="my_components")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", components_key="my_components")
 
 
 def test_identify_analysis_buffer_no_warning_for_reasonable_component_count():
@@ -272,7 +329,7 @@ def test_identify_analysis_buffer_no_warning_for_reasonable_component_count():
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # any warning fails the test
-        identify_analysis_buffer(adata, score="score", grid_type="rect")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
 
 def test_identify_analysis_buffer_n_counts_key_excludes_zero_count_spots():
@@ -283,7 +340,7 @@ def test_identify_analysis_buffer_n_counts_key_excludes_zero_count_spots():
     n_counts[0] = 0  # exclude one spot
     adata.obs["n_counts"] = n_counts
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", n_counts_key="n_counts")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", n_counts_key="n_counts")
 
     assert not adata.obs["analysis_buffer"].iloc[0]  # excluded spot is never in the buffer
     fit_info = adata.uns["analysis_buffer_fit"]["per_component"]
@@ -309,7 +366,7 @@ def test_identify_analysis_buffer_fits_components_independently():
     )
     adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     per_component = adata.uns["analysis_buffer_fit"]["per_component"]
     assert len(per_component) == 2
@@ -329,7 +386,7 @@ def test_identify_analysis_buffer_no_surviving_components_raises():
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
     adata.obs["n_counts"] = np.zeros(len(row))
     with pytest.raises(ValueError, match="No connected components"):
-        identify_analysis_buffer(adata, score="score", grid_type="rect", n_counts_key="n_counts")
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", n_counts_key="n_counts")
 
 
 def test_identify_analysis_buffer_writes_border_column():
@@ -346,7 +403,7 @@ def test_identify_analysis_buffer_writes_border_column():
     n_counts[corner_idx] = 0  # this corner is excluded -- should read False despite being a true border node
     adata.obs["n_counts"] = n_counts
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", n_counts_key="n_counts")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", n_counts_key="n_counts")
 
     assert "border" in adata.obs
     assert adata.obs["border"].dtype == bool
@@ -361,9 +418,142 @@ def test_identify_analysis_buffer_border_key_is_configurable():
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect", border_key="is_border_spot")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect", border_key="is_border_spot")
     assert "is_border_spot" in adata.obs
     assert "border" not in adata.obs
+
+
+def test_identify_analysis_buffer_filters_zero_count_spots_by_default():
+    """n_counts_key defaults to "n_counts": zero-count spots are excluded
+    without having to ask for it."""
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.obs.loc[adata.obs_names[0], "n_counts"] = 0
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+
+    assert adata.uns["analysis_buffer_fit"]["per_component"][0]["n_spots"] == len(row) - 1
+    assert adata.obs["components"].iloc[0] < 0
+
+
+def test_identify_analysis_buffer_bin_size_defaults_to_load_filtered_metadata():
+    RNG = np.random.default_rng(42)
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    adata.uns["bosperrus"] = {"bin_size_um": 8.0}
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+
+    assert adata.uns["analysis_buffer_fit"]["bin_size_um"] == 8.0
+    # corner spot (0, 0) is itself a border spot; its neighbour (0, 1) likewise --
+    # interior spot (1, 1) is one grid step (= 8um) from the border
+    idx = np.flatnonzero((row == 1) & (col == 1))[0]
+    assert adata.obs["distance_to_border"].iloc[idx] == pytest.approx(8.0)
+
+
+def test_identify_analysis_buffer_fills_small_enclosed_holes():
+    """A single empty bin inside the tissue is filled (default
+    max_hole_area_um2): it's kept and fit with its 0 counts, and its
+    neighbours are not border bins. Without filling, they are."""
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    hole = np.flatnonzero((row == 10) & (col == 10))[0]
+    adata.obs.iloc[hole, adata.obs.columns.get_loc("n_counts")] = 0
+    neighbours = np.flatnonzero((np.abs(row - 10) + np.abs(col - 10)) == 1)
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+    assert adata.obs["components"].iloc[hole] >= 0
+    assert not adata.obs["border"].iloc[neighbours].any()
+    assert adata.uns["analysis_buffer_fit"]["per_component"][0]["n_spots"] == len(row)
+    assert adata.uns["analysis_buffer_fit"]["n_filled_hole_bins"] == 1
+
+    unfilled = adata.copy()
+    for key in ["components", "distance_to_border"]:
+        del unfilled.obs[key]
+    identify_analysis_buffer_from_filtered(unfilled, score="score", grid_type="rect", max_hole_area_um2=None)
+    assert unfilled.obs["components"].iloc[hole] < 0
+    assert unfilled.obs["border"].iloc[neighbours].all()
+
+
+def test_identify_analysis_buffer_hole_limit_is_an_area():
+    """max_hole_area_um2 is in um^2: a 3x3 hole (9 bins) is filled at
+    bin_size_um=1 with the default 1024 um^2, but not at bin_size_um=16
+    (9 * 256 = 2304 um^2 > 1024)."""
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    in_hole = (np.abs(row - 10) <= 1) & (np.abs(col - 10) <= 1)
+    adata.obs.loc[in_hole, "n_counts"] = 0
+
+    a = adata.copy()
+    identify_analysis_buffer_from_filtered(a, score="score", grid_type="rect", bin_size_um=1.0)
+    assert (a.obs["components"].to_numpy()[in_hole] >= 0).all()
+    b = adata.copy()
+    identify_analysis_buffer_from_filtered(b, score="score", grid_type="rect", bin_size_um=16.0)
+    assert (b.obs["components"].to_numpy()[in_hole] < 0).all()
+
+
+def test_identify_analysis_buffer_fills_holes_without_rows():
+    """Hole positions with no row at all (e.g. a Stereo-seq bin with no
+    counts, which a gef never lists) count as tissue for adjacency and are
+    recorded, but add nothing to the fit."""
+    RNG = np.random.default_rng(42)
+    n_side = 20
+    adata, row, col = _rect_grid_adata(n_side)
+    keep = ~((row == 10) & (col == 10))
+    adata = adata[keep].copy()
+    row, col = row[keep], col[keep]
+    adata.obs["score"] = RNG.normal(5.0, 0.1, size=len(row))
+    neighbours = np.flatnonzero((np.abs(row - 10) + np.abs(col - 10)) == 1)
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+    assert not adata.obs["border"].iloc[neighbours].any()
+    virtual = adata.uns["analysis_buffer_fit"]["filled_hole_positions"]
+    assert list(zip(virtual["array_row"], virtual["array_col"])) == [(10, 10)]
+    assert adata.uns["analysis_buffer_fit"]["per_component"][0]["n_spots"] == len(row)
+
+
+def test_identify_analysis_buffer_hole_filling_rejects_hex():
+    adata, row, col = _rect_grid_adata()
+    adata.obs["score"] = np.ones(len(row))
+    with pytest.raises(ValueError, match="max_hole_area_um2"):
+        identify_analysis_buffer_from_filtered(adata, score="score", grid_type="hex")
+
+
+def test_identify_analysis_buffer_ignores_negative_slope_elbow():
+    """A winning piecewise fit whose score falls into the tissue (m < 0) is
+    not a border effect: no buffer, border_effect False, elbow_um None."""
+    RNG = np.random.default_rng(42)
+    n_side = 30
+    adata, row, col = _rect_grid_adata(n_side)
+    d_true = _distance_to_nearest_edge(row, col, n_side)
+    signal = PiecewiseLinearFit.piecewise_plateau(d_true, 5.0, -1.0, 20.0)  # high at border, falling inward
+    adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    assert info["best_fit_type"] == "Piecewise Linear Fit"
+    assert info["params"]["piecewise_linear_m"] < 0
+    assert info["border_effect"] is False and info["elbow_um"] is None
+    assert not adata.obs["analysis_buffer"].any()
+
+
+def test_identify_analysis_buffer_records_positive_slope_elbow():
+    RNG = np.random.default_rng(42)
+    n_side = 30
+    adata, row, col = _rect_grid_adata(n_side)
+    d_true = _distance_to_nearest_edge(row, col, n_side)
+    adata.obs["score"] = PiecewiseLinearFit.piecewise_plateau(d_true, 5.0, 1.0, 10.0) + RNG.normal(0, 0.05, size=len(row))
+
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    assert info["border_effect"] is True
+    assert info["elbow_um"] == pytest.approx(5.0, abs=0.5)
+    assert adata.obs["analysis_buffer"].any()
 
 
 # ---------------------------------------------------------------------------
@@ -516,251 +706,7 @@ def test_correct_layer_fits_components_independently():
 
 
 # ---------------------------------------------------------------------------
-# quantify_diffusion
-# ---------------------------------------------------------------------------
-
-def test_quantify_diffusion_mask_distance_key_overrides_computed_distance():
-    """mask_distance_key reuses that .obs column directly instead of
-    computing via image_masks.get_tissue_mask/distances.distance_to_mask --
-    verified with a known ExponentialSaturationFit signal (a < 0, since
-    counts decay AWAY from tissue) against an injected distance column, and
-    checked against the alpha=-a/bin_size_um**2, beta=b convention."""
-    RNG = np.random.default_rng(42)
-    n_side = 30
-    adata, row, col = _rect_grid_adata(n_side)
-    fake_distance = RNG.uniform(0, 20, size=len(row))
-    adata.obs["my_mask_distance"] = fake_distance
-
-    a_true, b_true, c_true = -4.0, 0.5, 10.0
-    signal = ExponentialSaturationFit.exp_sat(fake_distance, a_true, b_true, c_true)
-    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
-
-    bin_size_um = 8.0
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect",
-        bin_size_um=bin_size_um, mask_distance_key="my_mask_distance",
-    )
-
-    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
-    assert fit_info["best_fit_type"] == "Exponential Saturation Fit"
-    assert fit_info["alpha"] == pytest.approx(-a_true / bin_size_um**2, rel=0.2)
-    assert fit_info["beta"] == pytest.approx(b_true, rel=0.3)
-
-
-def test_quantify_diffusion_picks_exponential_decay_when_floor_is_zero():
-    """When the true far-field value genuinely is 0 (no c offset),
-    ExponentialDecayFit's one-fewer-parameter should win over
-    ExponentialSaturationFit on AIC -- and alpha should come out positive
-    directly from its `a` (no sign flip needed, unlike ExponentialSaturationFit's).
-
-    Needs low noise AND a modest n to be decisive: log_likelihood is
-    -0.5*n*log(sigma2), so at large n (e.g. 900 spots) even a tiny relative
-    SSE reduction from ExponentialSaturationFit's extra, nearly-redundant c
-    (its curve_fit still finds a+c very close to 0, i.e. essentially the
-    same curve as ExponentialDecayFit -- but "nearly the same" still isn't
-    "exactly the same" on any single finite noisy sample) gets amplified
-    into a real AIC edge that overcomes the fixed 2-unit parameter-count
-    penalty, regardless of how low the noise is -- an honest, expected
-    large-N property of AIC here, not a bug, and not something a smaller
-    per-component sample (typical for this kind of per-component fit) runs
-    into: confirmed empirically, decay wins reliably once n <~ 225."""
-    RNG = np.random.default_rng(42)
-    n_side = 15
-    adata, row, col = _rect_grid_adata(n_side)
-    fake_distance = RNG.uniform(0, 20, size=len(row))
-    adata.obs["my_mask_distance"] = fake_distance
-
-    a_true, b_true = 4.0, 0.5
-    signal = ExponentialDecayFit.exp_decay(fake_distance, a_true, b_true)
-    adata.obs["n_counts"] = signal + RNG.normal(0, 0.001, size=len(row))
-
-    bin_size_um = 8.0
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect",
-        bin_size_um=bin_size_um, mask_distance_key="my_mask_distance",
-    )
-
-    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
-    assert fit_info["best_fit_type"] == "Exponential Decay Fit"
-    assert fit_info["alpha"] == pytest.approx(a_true / bin_size_um**2, rel=0.2)
-    assert fit_info["beta"] == pytest.approx(b_true, rel=0.3)
-
-
-def test_quantify_diffusion_no_effect_gives_none_alpha_beta():
-    RNG = np.random.default_rng(42)
-    adata, row, col = _rect_grid_adata()
-    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
-    )
-
-    fit_info = adata.uns["diffusion_fit"]["per_component"][0]
-    assert fit_info["best_fit_type"] == "Constant Fit"
-    assert fit_info["alpha"] is None
-    assert fit_info["beta"] is None
-
-
-def test_quantify_diffusion_writes_components_and_distance_by_default():
-    RNG = np.random.default_rng(42)
-    adata, row, col = _rect_grid_adata()
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
-    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
-    )
-
-    assert "components" in adata.obs
-    assert (adata.obs["components"] == 0).all()
-
-
-def test_quantify_diffusion_non_numeric_mask_distance_key_raises_clear_error():
-    RNG = np.random.default_rng(42)
-    adata, row, col = _rect_grid_adata()
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
-    adata.obs["my_mask_distance"] = [f"far_{i}" for i in range(len(row))]
-
-    with pytest.raises(ValueError, match="must be numeric"):
-        quantify_diffusion(
-            adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
-        )
-
-
-def test_quantify_diffusion_negative_mask_distance_key_raises_clear_error():
-    RNG = np.random.default_rng(42)
-    adata, row, col = _rect_grid_adata()
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
-    fake_distance = RNG.uniform(0, 5, size=len(row))
-    fake_distance[0] = -1.0
-    adata.obs["my_mask_distance"] = fake_distance
-
-    with pytest.raises(ValueError, match="contains negative values"):
-        quantify_diffusion(
-            adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
-        )
-
-
-def test_quantify_diffusion_fits_components_independently():
-    """Two disconnected blocks with DIFFERENT true diffusion amplitudes --
-    pooling them into one global fit would blur both; per-component fitting
-    should recover each block's own alpha."""
-    RNG = np.random.default_rng(42)
-    adata, row, col, block_a_mask, n_side, gap = _two_block_adata()
-    fake_distance = RNG.uniform(0, 20, size=len(row))
-    adata.obs["my_mask_distance"] = fake_distance
-
-    a_a, a_b, b_true, c_true = -4.0, -8.0, 0.5, 10.0
-    signal = np.where(
-        block_a_mask,
-        ExponentialSaturationFit.exp_sat(fake_distance, a_a, b_true, c_true),
-        ExponentialSaturationFit.exp_sat(fake_distance, a_b, b_true, c_true),
-    )
-    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect",
-        bin_size_um=1.0, mask_distance_key="my_mask_distance",
-    )
-
-    per_component = adata.uns["diffusion_fit"]["per_component"]
-    assert len(per_component) == 2
-    fitted_alphas = sorted(
-        info["alpha"] for info in per_component.values() if info["alpha"] is not None
-    )
-    assert len(fitted_alphas) == 2
-    assert fitted_alphas[0] == pytest.approx(min(-a_a, -a_b), rel=0.3)
-    assert fitted_alphas[1] == pytest.approx(max(-a_a, -a_b), rel=0.3)
-
-
-def test_quantify_diffusion_computes_mask_distance_from_real_image():
-    """End-to-end smoke test of the real path (no mask_distance_key
-    override): get_tissue_mask segments a synthetic image, native pixel
-    size is calibrated from the grid, and distance_to_mask is computed --
-    checks the result is sane (non-negative, some spots genuinely outside),
-    not exact parameter recovery (covered by the override-based tests above)."""
-    pytest.importorskip("skimage", reason="scikit-image not installed")
-
-    RNG = np.random.default_rng(42)
-    n_side = 20
-    adata, row, col = _rect_grid_adata(n_side)
-    pixel_pitch = 10.0  # native px per grid step
-    adata.obsm["spatial"] = np.column_stack([col * pixel_pitch, row * pixel_pitch]).astype(float)
-
-    size = int(n_side * pixel_pitch) + 20
-    image = np.full((size, size, 3), 255, dtype=np.uint8)
-    lo, hi = int(size * 0.25), int(size * 0.75)
-    image[lo:hi, lo:hi, :] = 30  # dark "tissue" square in the middle
-    adata.uns["spatial"] = {
-        "sample1": {"images": {"hires": image}, "scalefactors": {"tissue_hires_scalef": 1.0}}
-    }
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.5, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="sample1", score="n_counts", grid_type="rect", bin_size_um=8.0,
-        segment_kwargs=dict(sigma=2, close_radius=3, min_hole_area=100, min_object_area=100),
-    )
-
-    assert "distance_to_mask" in adata.obs
-    assert (adata.obs["distance_to_mask"] >= 0).all()
-    assert adata.obs["distance_to_mask"].max() > 0
-
-
-def test_quantify_diffusion_writes_mask_as_plottable_spatial_image():
-    """The computed mask lands in adata.uns["spatial"][library_id]["images"]
-    under mask_image_key, with a matching scalefactor -- the exact shape
-    sc.pl.spatial(adata, library_id=..., img_key=mask_image_key) reads."""
-    pytest.importorskip("skimage", reason="scikit-image not installed")
-
-    RNG = np.random.default_rng(42)
-    n_side = 20
-    adata, row, col = _rect_grid_adata(n_side)
-    pixel_pitch = 10.0
-    adata.obsm["spatial"] = np.column_stack([col * pixel_pitch, row * pixel_pitch]).astype(float)
-
-    size = int(n_side * pixel_pitch) + 20
-    image = np.full((size, size, 3), 255, dtype=np.uint8)
-    lo, hi = int(size * 0.25), int(size * 0.75)
-    image[lo:hi, lo:hi, :] = 30
-    adata.uns["spatial"] = {
-        "sample1": {"images": {"hires": image}, "scalefactors": {"tissue_hires_scalef": 1.0}}
-    }
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.5, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="sample1", score="n_counts", grid_type="rect", bin_size_um=8.0,
-        segment_kwargs=dict(sigma=2, close_radius=3, min_hole_area=100, min_object_area=100),
-    )
-
-    spatial_meta = adata.uns["spatial"]["sample1"]
-    assert "mask" in spatial_meta["images"]
-    mask_image = spatial_meta["images"]["mask"]
-    assert mask_image.shape == image.shape[:2]
-    assert mask_image.dtype == np.uint8
-    assert set(np.unique(mask_image)) <= {0, 255}
-    assert "tissue_mask_scalef" in spatial_meta["scalefactors"]
-    assert spatial_meta["scalefactors"]["tissue_mask_scalef"] == pytest.approx(1.0)
-
-
-def test_quantify_diffusion_no_mask_image_written_when_mask_distance_key_reused():
-    """No mask is computed at all when mask_distance_key is reused, so
-    nothing new should be written to uns["spatial"]."""
-    RNG = np.random.default_rng(42)
-    adata, row, col = _rect_grid_adata()
-    adata.obs["n_counts"] = RNG.normal(5.0, 0.1, size=len(row))
-    adata.obs["my_mask_distance"] = RNG.uniform(0, 10, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect", mask_distance_key="my_mask_distance",
-    )
-
-    assert "spatial" not in adata.uns
-    assert "diffusion_fit" in adata.uns
-
-
-# ---------------------------------------------------------------------------
-# plot_border_effect / plot_diffusion
+# plot_border_effect
 # ---------------------------------------------------------------------------
 
 def test_plot_border_effect_one_subplot_per_component():
@@ -775,7 +721,7 @@ def test_plot_border_effect_one_subplot_per_component():
     signal = PiecewiseLinearFit.piecewise_plateau(d_true, b_true, m_true, c_true)
     adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
 
     fig = plot_border_effect(adata, score="score", ncols=4)
     n_components = len(adata.uns["analysis_buffer_fit"]["per_component"])
@@ -788,7 +734,7 @@ def test_plot_border_effect_one_subplot_per_component():
 def test_plot_border_effect_raises_without_prior_run():
     adata, row, col = _rect_grid_adata()
     adata.obs["score"] = np.zeros(len(row))
-    with pytest.raises(KeyError, match="run identify_analysis_buffer first"):
+    with pytest.raises(KeyError, match="run identify_analysis_buffer_from_filtered first"):
         plot_border_effect(adata, score="score")
 
 
@@ -805,42 +751,8 @@ def test_plot_border_effect_works_after_reused_string_components_key():
     adata.obs["score"] = signal + RNG.normal(0, 0.05, size=len(row))
     adata.obs["components"] = np.zeros(len(row), dtype=int).astype(str)
 
-    identify_analysis_buffer(adata, score="score", grid_type="rect")
+    identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
     fig = plot_border_effect(adata, score="score")
 
     assert len(fig.get_axes()[0].get_lines()) == 1
     plt.close(fig)
-
-
-def test_plot_diffusion_one_subplot_per_component():
-    RNG = np.random.default_rng(42)
-    adata, row, col, block_a_mask, n_side, gap = _two_block_adata()
-    fake_distance = RNG.uniform(0, 20, size=len(row))
-    adata.obs["my_mask_distance"] = fake_distance
-
-    a_a, a_b, b_true, c_true = -4.0, -8.0, 0.5, 10.0
-    signal = np.where(
-        block_a_mask,
-        ExponentialSaturationFit.exp_sat(fake_distance, a_a, b_true, c_true),
-        ExponentialSaturationFit.exp_sat(fake_distance, a_b, b_true, c_true),
-    )
-    adata.obs["n_counts"] = signal + RNG.normal(0, 0.05, size=len(row))
-
-    quantify_diffusion(
-        adata, library_id="unused", score="n_counts", grid_type="rect",
-        bin_size_um=1.0, mask_distance_key="my_mask_distance",
-    )
-
-    fig = plot_diffusion(adata, score="n_counts", mask_distance_key="my_mask_distance")
-    n_components = len(adata.uns["diffusion_fit"]["per_component"])
-    assert n_components == 2
-    lines_per_axes = [len(ax.get_lines()) for ax in fig.get_axes()]
-    assert sum(1 for n in lines_per_axes if n == 1) == n_components
-    plt.close(fig)
-
-
-def test_plot_diffusion_raises_without_prior_run():
-    adata, row, col = _rect_grid_adata()
-    adata.obs["n_counts"] = np.zeros(len(row))
-    with pytest.raises(KeyError, match="run quantify_diffusion first"):
-        plot_diffusion(adata, score="n_counts")
