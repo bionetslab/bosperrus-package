@@ -85,7 +85,7 @@ All fit models subclass `Fit`. The base class:
 
 **Correction formula**: all saturation models shift raw values to the asymptote: `S_corrected = S_true + (asymptote - S_model)`. If fitting fails (`_converged = False`), `S_corrected = S_true` (passthrough).
 
-**PiecewiseLinearFit** is special: it uses `scipy.optimize.curve_fit` followed by optional `differential_evolution` refinement seeded around the `curve_fit` solution. `fraction_not_converged` is the fraction of nodes with `d ≤ b` (hard boundary, not asymptotic).
+**Global fitting (all non-constant models):** every model is linear in its amplitude/offset and nonlinear in one parameter b, so `fit()` never uses a single-start local optimizer (that got stuck in local optima on real data). `PiecewiseLinearFit` solves the knot exactly: for b between two consecutive distinct distances the objective has a closed-form stationary point, and all intervals are evaluated via cumulative sums (`fraction_not_converged` is the fraction of nodes with `d <= b`). `ExponentialSaturationFit`/`MichaelisMentenFit`/`ExponentialDecayFit` scan b over a data-driven log grid with an exact linear solve per b (`_profile_fit`), then refine with bounded 1-D minimisation.
 
 ### Model selection (`flow.flow()`)
 

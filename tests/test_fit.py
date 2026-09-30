@@ -833,3 +833,78 @@ class TestFitCorrectPassthrough:
         np.testing.assert_allclose(result_vals, original_vals, err_msg=(
             "correct() passthrough should return S_true unchanged when not converged"
         ))
+
+
+# ---------------------------------------------------------------------------
+# Global optimum: every model is linear given its one nonlinear parameter b,
+# and the fit must find the best b even when SSE(b) has several separated
+# minima (which a single-start local optimizer cannot guarantee).
+# ---------------------------------------------------------------------------
+
+def _two_scale_data(kind, n=6000, seed=0):
+    rng = np.random.default_rng(seed)
+    d = rng.uniform(0, 200, n)
+    if kind == "pwl":   # sharp step at ~3 plus a slow ramp to ~120: two separated knot optima
+        y = PiecewiseLinearFit.piecewise_plateau(d, 3.0, 4.0, 0.0) + PiecewiseLinearFit.piecewise_plateau(d, 120.0, 0.05, 0.0)
+    elif kind == "sat":  # fast + slow saturation
+        y = 5 * (1 - np.exp(-d / 2)) + 4 * (1 - np.exp(-d / 60))
+    elif kind == "decay":
+        y = 5 * np.exp(-d / 2) + 4 * np.exp(-d / 60)
+    return d, y + rng.normal(0, 0.3, n)
+
+
+def _brute_force_sse(d, y, basis, b_values, intercept=True):
+    best = np.inf
+    for b in b_values:
+        x = basis(d, b)
+        X = np.column_stack([x, np.ones_like(x)]) if intercept else x[:, None]
+        coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+        best = min(best, float(np.sum((X @ coef - y) ** 2)))
+    return best
+
+
+@pytest.mark.parametrize("cls,kind,basis,b_values,intercept", [
+    (PiecewiseLinearFit, "pwl", lambda d, b: np.minimum(d, b), np.linspace(0.05, 200, 8000), True),
+    (ExponentialSaturationFit, "sat", lambda d, b: 1 - np.exp(-b * d), np.logspace(-5, 2, 4000), True),
+    (MichaelisMentenFit, "sat", lambda d, b: d / (b + d), np.logspace(-3, 6, 4000), True),
+    (ExponentialDecayFit, "decay", lambda d, b: np.exp(-b * d), np.logspace(-5, 2, 4000), False),
+])
+def test_fit_reaches_global_least_squares_optimum(cls, kind, basis, b_values, intercept):
+    d, y = _two_scale_data(kind)
+    fit = cls(pd.Series(y), pd.Series(d))
+    fit.fit()
+    assert fit._converged
+    sse_fit = float(np.sum((fit.predict(d) - y) ** 2))
+    sse_brute = _brute_force_sse(d, y, basis, b_values, intercept)
+    assert sse_fit <= sse_brute * (1 + 1e-6)
+
+
+def test_piecewise_fit_does_not_depend_on_median_start():
+    """Regression for the single-start failure: a large step at d~3 (the
+    global least-squares knot) plus a small ramp just below the median
+    distance, which creates a second, worse local optimum at b~100. The old
+    fit (curve_fit started at b = median(d)) returned b~105-112 here for
+    every seed tried; the global scan must find b~3."""
+    for seed in range(3):
+        rng = np.random.default_rng(seed)
+        d = rng.uniform(0, 200, 5000)
+        y = (PiecewiseLinearFit.piecewise_plateau(d, 3.0, 5.0, 0.0)
+             + np.clip((d - 80) / 20, 0, 1) + rng.normal(0, 0.5, len(d)))
+        fit = PiecewiseLinearFit(pd.Series(y), pd.Series(d))
+        fit.fit()
+        assert fit.params["piecewise_linear_b"] == pytest.approx(3.0, abs=0.5)
+
+
+def test_piecewise_fit_is_exact_between_discrete_distances():
+    """Grid distances take few distinct values; the least-squares knot can lie
+    strictly between two of them. The closed-form interval solve must match a
+    very dense brute-force scan over b."""
+    rng = np.random.default_rng(1)
+    d = rng.integers(0, 21, 4000).astype(float)
+    y = PiecewiseLinearFit.piecewise_plateau(d, 5.5, 2.0, 1.0) + rng.normal(0, 0.5, len(d))
+    fit = PiecewiseLinearFit(pd.Series(y), pd.Series(d))
+    fit.fit()
+    sse_fit = float(np.sum((fit.predict(d) - y) ** 2))
+    sse_brute = _brute_force_sse(d, y, lambda dd, b: np.minimum(dd, b), np.linspace(0, 20, 20001))
+    assert sse_fit <= sse_brute * (1 + 1e-9)
+    assert 5.0 < fit.params["piecewise_linear_b"] < 6.0

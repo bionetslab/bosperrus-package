@@ -1,10 +1,94 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import curve_fit, differential_evolution
+from scipy.optimize import minimize_scalar
 from .evaluate_fit import log_likelihood, akaike_information_criterion
 
 _EPS = 1e-10
 _DEFAULT_CONVERGENCE_THRESHOLD = 0.95
+
+# Every non-constant model here is linear in its amplitude/offset and nonlinear in
+# exactly one parameter b: S(d) = a * g(d, b) [+ c]. For fixed b the best a (and c)
+# is an exact linear least-squares solution, so the fit reduces to minimising the
+# 1-D profile SSE(b) ("variable projection"). SSE(b) can have several local minima
+# (and long flat valleys towards degenerate limits: linear as b -> 0 / infinity, a
+# step at the other end), which a single-start local optimizer such as curve_fit
+# can't escape -- so b is found by an exact scan over a grid covering the whole
+# data-supported range, then refined by bounded 1-D minimisation between the best
+# grid point's neighbours.
+_N_B_GRID = 200
+
+
+def _linear_solve(x, y, intercept):
+    """Least squares y ~ a*x (+ c); returns (a, c, sse), or None if x is degenerate."""
+    n = len(y)
+    if intercept:
+        x_mean, y_mean = x.mean(), y.mean()
+        xc = x - x_mean
+        sxx = np.dot(xc, xc)
+        if sxx <= 1e-12 * max(1.0, np.dot(x, x)):
+            return None
+        a = np.dot(xc, y - y_mean) / sxx
+        c = y_mean - a * x_mean
+    else:
+        sxx = np.dot(x, x)
+        if sxx <= 1e-300:
+            return None
+        a, c = np.dot(x, y) / sxx, 0.0
+    r = y - (a * x + c)
+    return a, c, float(np.dot(r, r))
+
+
+def _profile_fit(d, y, basis, b_grid, intercept, refine=True, log_scale=True):
+    """Global least-squares fit of y ~ a*basis(d, b) (+ c) over b: exact scan of
+    b_grid, then bounded 1-D refinement between the best grid point's neighbours.
+    Returns (a, b, c). Raises RuntimeError if no b gives a non-degenerate fit."""
+    d = np.asarray(d, dtype=float)
+    y = np.asarray(y, dtype=float)
+    b_grid = np.asarray(b_grid, dtype=float)
+    sse = np.full(len(b_grid), np.inf)
+    for i, b in enumerate(b_grid):
+        sol = _linear_solve(basis(d, b), y, intercept)
+        if sol is not None:
+            sse[i] = sol[2]
+    if not np.isfinite(sse).any():
+        raise RuntimeError("no non-degenerate fit over the b grid")
+    i = int(np.argmin(sse))
+    b_best = b_grid[i]
+    if refine and len(b_grid) > 1:
+        lo, hi = b_grid[max(i - 1, 0)], b_grid[min(i + 1, len(b_grid) - 1)]
+        t = np.log if log_scale else (lambda v: v)
+        t_inv = np.exp if log_scale else (lambda v: v)
+
+        def profile(tb):
+            sol = _linear_solve(basis(d, t_inv(tb)), y, intercept)
+            return np.inf if sol is None else sol[2]
+
+        res = minimize_scalar(profile, bounds=(t(lo), t(hi)), method="bounded", options={"xatol": 1e-6})
+        if res.success and res.fun < sse[i]:
+            b_best = float(t_inv(res.x))
+    a, c, _ = _linear_solve(basis(d, b_best), y, intercept)
+    return a, float(b_best), c
+
+
+def _rate_grid(d, n=_N_B_GRID):
+    """Log grid for a rate b (1/distance) spanning every scale the data can
+    resolve: from 1e-3 / range(d) (effectively linear over the data) to
+    1e3 / smallest positive d (effectively a step at the first distance)."""
+    d = np.asarray(d, dtype=float)
+    d_pos = d[d > 0]
+    span = np.ptp(d) if np.ptp(d) > 0 else 1.0
+    d_min = d_pos.min() if len(d_pos) else span
+    return np.logspace(np.log10(1e-3 / span), np.log10(1e3 / d_min), n)
+
+
+def _scale_grid(d, n=_N_B_GRID):
+    """Log grid for a half-saturation distance b: 1e-3 * smallest positive d
+    (a step) to 1e3 * max(d) (effectively linear over the data)."""
+    d = np.asarray(d, dtype=float)
+    d_pos = d[d > 0]
+    d_max = d.max() if d.max() > 0 else 1.0
+    d_min = d_pos.min() if len(d_pos) else d_max
+    return np.logspace(np.log10(1e-3 * d_min), np.log10(1e3 * d_max), n)
 
 __all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'ExponentialDecayFit', 'MichaelisMentenFit']
 
@@ -181,7 +265,7 @@ class Fit():
             result[self._mask] = filtered_data
             return result
 
-    def fit(self):
+    def fit(self, maxfev=2000):
         """
         Estimate model parameters from S_true and d.
 
@@ -351,9 +435,13 @@ class PiecewiseLinearFit(Fit):
         Fits a piecewise linear model with a plateau: S(d) = m*d + c for d <= b,
         and S(d) = m*b + c for d > b, where b is the knot (breakpoint).
 
-        The fit is initialised with scipy's curve_fit and optionally refined with
-        differential evolution seeded around the curve_fit solution, to avoid
-        local minima near the knot location.
+        Fitted globally and exactly (see `_fit_piece_wise_linear`): for a fixed
+        knot b the model is linear in (m, c), and the least-squares objective
+        over b is solved in closed form on every interval between consecutive
+        distinct distances -- no dependence on a starting guess, which a
+        single local optimizer has (the knot's objective routinely has several
+        separated minima). refine_fit=False only evaluates knots at the
+        observed distances themselves.
 
         Convergence is structurally defined by the knot b: nodes with d > b are
         on the plateau and considered fully converged; nodes with d <= b are in
@@ -373,49 +461,60 @@ class PiecewiseLinearFit(Fit):
     def piecewise_plateau(d, b, m, c):
         return np.where(d <= b, m * d + c, m * b + c)
 
-    def _refine_fit(self, p_opt):
-        def residuals(params):
-            return np.sum((self.piecewise_plateau(self._d, *params) - self._S_true) ** 2)
-        
-        # Build a search region around the curve_fit solution
-        spread = np.abs(p_opt) * 0.5 + 1e-6  # 50% spread around solution, avoid zero
-        de_bounds = [
-            (max(p_opt[0] - spread[0], np.min(self._d)), min(p_opt[0] + spread[0], np.max(self._d))),  # b
-            (p_opt[1] - spread[1], p_opt[1] + spread[1]),  # m
-            (p_opt[2] - spread[2], p_opt[2] + spread[2]),  # c
-        ]
-        
-        # Seed the population around the curve_fit solution
-        rng = np.random.default_rng(42)
-        popsize = 15
-        population = p_opt + rng.uniform(-0.5, 0.5, size=(popsize, len(p_opt))) * spread
-        
-        de_result = differential_evolution(
-            residuals,
-            bounds=de_bounds,
-            init=population,
-            seed=42,
-            tol=1e-10,
-        )
-        
-        # Only accept if better (guaranteed not to be worse due to init)
-        if de_result.fun < residuals(p_opt):
-            p_opt = de_result.x
-        return p_opt
-
     def _fit_piece_wise_linear(self, refine_fit):
-        p0 = [np.median(self._d), 1.0, np.mean(self._S_true)]
-        lower_bounds = [np.min(self._d), -np.inf, -np.inf]
-        upper_bounds = [np.max(self._d), np.inf, np.inf]
-        p_opt, _ = curve_fit(self.piecewise_plateau, self._d, self._S_true, p0=p0, bounds=(lower_bounds, upper_bounds), maxfev=2000)
-        
+        """Exact global least-squares fit. For a knot b the model is linear in
+        (m, c) with regressor x = min(d, b). Between two consecutive distinct
+        distances d_k <= b < d_(k+1) the set of points left of the knot is
+        fixed, so the centred sums are sxy(b) = alpha + beta*b and
+        sxx(b) = q0 + q1*b + q2*b^2, and SSE(b) = syy - sxy^2/sxx has at most
+        one interior stationary point, b* = (alpha*q1 - 2*beta*q0) /
+        (beta*q1 - 2*alpha*q2). Evaluating every interval's endpoints (and,
+        with refine_fit=True, its b*) via cumulative sums gives the global
+        optimum over all b in [min(d), max(d)] in O(n log n) -- no starting
+        guess, no local search."""
+        d = np.asarray(self._d, dtype=float)
+        y = np.asarray(self._S_true, dtype=float)
+        order = np.argsort(d, kind="stable")
+        ds, ys = d[order], y[order]
+        n = len(ds)
+        cd, cd2, cdy, cy = (np.concatenate([[0.0], np.cumsum(v)]) for v in (ds, ds * ds, ds * ys, ys))
+        Sy, Syy = cy[-1], float(np.dot(ys, ys))
+        syy = Syy - Sy ** 2 / n
+
+        uniq = np.unique(ds)
+        if len(uniq) < 2:
+            raise RuntimeError("distances are constant -- knot not identifiable")
+        k_end = np.searchsorted(ds, uniq, side="right")  # points with d <= uniq[j]
+        # interval j: uniq[j] <= b < uniq[j+1], k = k_end[j] points left of the knot
+        k = k_end[:-1]
+        lo, hi = uniq[:-1], uniq[1:]
+        g = n - k                                    # points right of the knot (x = b)
+        A, B, C = cd[k], cd2[k], cdy[k]              # sums over the left points
+        Yg = Sy - cy[k]                              # sum of y over the right points
+        alpha, beta = C - A * Sy / n, Yg - g * Sy / n
+        q0, q1, q2 = B - A ** 2 / n, -2 * A * g / n, g - g ** 2 / n
+
+        def sse_at(bb):
+            sxx = q0 + q1 * bb + q2 * bb ** 2
+            sxy = alpha + beta * bb
+            ok = sxx > 1e-12 * np.maximum(1.0, B + g * bb ** 2)
+            return np.where(ok, syy - sxy ** 2 / np.where(ok, sxx, 1.0), np.inf)
+
+        cand_b = [lo, hi]
         if refine_fit:
-            p_opt = self._refine_fit(p_opt)
-        
-        b_opt, m_opt, c_opt = p_opt
-        C_fit = self.piecewise_plateau(self._d, b_opt, m_opt, c_opt)
+            den = beta * q1 - 2 * alpha * q2
+            with np.errstate(divide="ignore", invalid="ignore"):
+                b_star = np.where(den != 0, (alpha * q1 - 2 * beta * q0) / den, lo)
+            cand_b.append(np.clip(np.nan_to_num(b_star, nan=0.0, posinf=0.0, neginf=0.0), lo, hi))
+        sse = np.stack([sse_at(bb) for bb in cand_b])  # (n_candidates, n_intervals)
+        if not np.isfinite(sse).any():
+            raise RuntimeError("no non-degenerate knot")
+        which, j = np.unravel_index(np.argmin(sse), sse.shape)
+        b_opt = float(cand_b[which][j])
+        m_opt, c_opt, _ = _linear_solve(np.minimum(d, b_opt), y, intercept=True)
+        C_fit = self.piecewise_plateau(d, b_opt, m_opt, c_opt)
         return b_opt, m_opt, c_opt, C_fit
-    
+
     def _rate_observed_metrics(self):
         if not self._converged:
             self._observed_effect_strength = np.nan
@@ -508,11 +607,14 @@ class ExponentialSaturationFit(Fit):
     def exp_sat(d, a, b, c):
         return a * (1 - np.exp(-b * d)) + c
 
-    def _fit_exponential_saturation(self):
-        p0 = [max(self._S_true) - min(self._S_true), 1 / (np.mean(self._d) + 1e-6), min(self._S_true)]
-        bounds = ([-np.inf, 1e-6, -np.inf], [np.inf, np.inf, np.inf])
-        popt, _ = curve_fit(self.exp_sat, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
-        a_opt, b_opt, c_opt = popt
+    def _fit_exponential_saturation(self, maxfev=None):
+        """Global least-squares fit over the rate b (see `_profile_fit`); for
+        fixed b the model is linear in (a, c). maxfev is ignored (kept for
+        backward compatibility)."""
+        a_opt, b_opt, c_opt = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: 1 - np.exp(-b * d),
+            b_grid=_rate_grid(self._d), intercept=True,
+        )
         C_fit = self.exp_sat(self._d, a_opt, b_opt, c_opt)
         return a_opt, b_opt, c_opt, C_fit
 
@@ -625,11 +727,12 @@ class ExponentialDecayFit(Fit):
         return a * np.exp(-b * d)
 
     def _fit_exponential_decay(self):
-        a0 = self._S_true.iloc[np.argmin(self._d)] if hasattr(self._S_true, "iloc") else self._S_true[np.argmin(self._d)]
-        p0 = [a0, 1 / (np.mean(self._d) + 1e-6)]
-        bounds = ([-np.inf, 1e-6], [np.inf, np.inf])
-        popt, _ = curve_fit(self.exp_decay, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
-        a_opt, b_opt = popt
+        """Global least-squares fit over the rate b (see `_profile_fit`); for
+        fixed b the model is linear in a (no offset)."""
+        a_opt, b_opt, _ = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: np.exp(-b * d),
+            b_grid=_rate_grid(self._d), intercept=False,
+        )
         C_fit = self.exp_decay(self._d, a_opt, b_opt)
         return a_opt, b_opt, C_fit
 
@@ -732,10 +835,12 @@ class MichaelisMentenFit(Fit):
         return a * d / (b + d) + c
 
     def _fit_michaelis_menten(self):
-        p0 = [np.max(self._S_true) - np.min(self._S_true), np.median(self._d), np.min(self._S_true)]
-        bounds = ([-np.inf, 1e-6, -np.inf], [np.inf, np.inf, np.inf])
-        popt, _ = curve_fit(self.michaelis_menten, self._d, self._S_true, p0=p0, bounds=bounds, maxfev=2000)
-        a_opt, b_opt, c_opt = popt
+        """Global least-squares fit over the half-saturation distance b (see
+        `_profile_fit`); for fixed b the model is linear in (a, c)."""
+        a_opt, b_opt, c_opt = _profile_fit(
+            self._d, self._S_true, basis=lambda d, b: d / (b + d),
+            b_grid=_scale_grid(self._d), intercept=True,
+        )
         C_fit = self.michaelis_menten(self._d, a_opt, b_opt, c_opt)
         return a_opt, b_opt, c_opt, C_fit
 
