@@ -110,7 +110,8 @@ class Flow():
         self,
         score_names=None,
         fits=None,
-        baseline_fit_class=None
+        baseline_fit_class=None,
+        correction="additive",
     ):
         """
         Parameters
@@ -122,7 +123,16 @@ class Flow():
             `compute_centrality_measures`'s `measures` argument — these are
             arbitrary score column names (e.g. "log1p_total_counts", a gene
             name, ...), not restricted to a fixed set of centrality measures.
+        correction : {"additive", "multiplicative", "auto"}, default "additive"
+            How the winning fit corrects each score (see `Fit.correct`).
+            "additive" reproduces earlier BOSPERRUS versions exactly. "auto"
+            uses `Fit.suggest_correction_mode()` per score. The diagnostic is
+            computed and reported in `fit_quality` for every mode
+            (correction_mode_suggested, variance_model_dAIC, gamma, ...);
+            `fit_quality.loc["correction_mode"]` is the mode actually applied.
         """
+        if correction not in ("additive", "multiplicative", "auto"):
+            raise ValueError(f"correction must be 'additive', 'multiplicative' or 'auto', got {correction!r}")
         if fits is None:
             fits = [ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, MichaelisMentenFit]
         if baseline_fit_class is None:
@@ -168,6 +178,15 @@ class Flow():
             best_fit = min(fit_instances, key=lambda x: x.AIC)
             self.best_fits[score_name] = best_fit
             self._set_entropy_weights(fit_instances, baseline_fit)
+
+            diagnostic = best_fit.suggest_correction_mode()
+            mode = diagnostic["correction_mode_suggested"] if correction == "auto" else correction
+            if best_fit is baseline_fit:
+                best_fit.correction_mode = mode   # identity in both modes; record what was requested
+            elif mode != "additive":
+                best_fit.correct(mode)            # fit_correct() above applied the additive default
+            else:
+                best_fit.correction_mode = "additive"
 
             fit_quality_data[score_name] = best_fit.params_summary()
             self.observations[f"BOSPERRUS corrected {score_name}"] = best_fit.S_corrected

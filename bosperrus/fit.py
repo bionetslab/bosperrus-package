@@ -1,7 +1,10 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
-from .evaluate_fit import log_likelihood, akaike_information_criterion
+from .evaluate_fit import (log_likelihood, proportional_log_likelihood, akaike_information_criterion,
+                           scaled_relative_likelihood)
 
 _EPS = 1e-10
 _DEFAULT_CONVERGENCE_THRESHOLD = 0.95
@@ -166,6 +169,11 @@ class Fit():
         self.entropy_AIC_weights = None
         self.relative_likelihood_over_baseline = None
         self.scaled_relative_loglikelihood_over_baseline = None
+        # Set by correct_multiplicative() / suggest_correction_mode(); None until then.
+        self._multiplicative_n_undefined = None
+        self._multiplicative_max_factor = None
+        self.correction_diagnostic = None
+        self.correction_mode = None
 
     def __repr__(self):
         status = "converged" if self._converged else ("not fitted" if self._params is None else "failed to converge")
@@ -189,7 +197,12 @@ class Fit():
             "affected samples": self.fraction_not_converged,
             "relative_likelihood_over_baseline": self.relative_likelihood_over_baseline,
             "scaled_relative_likelihood_over_baseline": self.scaled_relative_loglikelihood_over_baseline,
+            "correction_mode": self.correction_mode,
+            "multiplicative_n_undefined": self._multiplicative_n_undefined,
+            "multiplicative_max_factor": self._multiplicative_max_factor,
         }
+        if self.correction_diagnostic is not None:
+            summary.update(self.correction_diagnostic)
         summary.update(self.params)
         return summary
 
@@ -275,14 +288,174 @@ class Fit():
         """
         raise NotImplementedError("Subclasses should implement this method")
 
-    def correct(self):
+    def correct(self, mode="additive"):
         """
         Apply the fitted model to produce a border-effect-corrected signal.
+
+        Parameters
+        ----------
+        mode : {"additive", "multiplicative"}, default "additive"
+            "additive" shifts every value by the gap between the model's plateau
+            and the fitted curve (S + plateau - S_model; see `correct_additive`).
+            "multiplicative" rescales every value by the fraction of the plateau
+            the curve reaches at its distance (S * plateau / S_model; see
+            `correct_multiplicative`). Both make the fitted mean constant at the
+            plateau; they differ in how the spread around the curve is treated.
+            Use `suggest_correction_mode()` to choose between them from the data.
+
+        Returns self.S_corrected (expanded back to the original index).
+        """
+        if mode not in ("additive", "multiplicative"):
+            raise ValueError(f"mode must be 'additive' or 'multiplicative', got {mode!r}")
+        self.correction_mode = mode
+        if mode == "additive":
+            return self.correct_additive()
+        return self.correct_multiplicative()
+
+    def correct_additive(self):
+        """
+        Additive correction: S_corrected = S_true + plateau - S_model.
+
+        Each value keeps its absolute deviation from the fitted curve. Appropriate
+        when the border removes a roughly fixed amount from every node (constant
+        residual spread across distance).
 
         Must set self._S_corrected and return self.S_corrected (the property),
         which automatically expands the result back to the original index.
         """
         raise NotImplementedError("Subclasses should implement this method")
+
+    def correct_multiplicative(self):
+        """
+        Multiplicative correction: S_corrected = S_true * plateau / S_model.
+
+        Each value is divided by the fraction of the plateau the fitted curve
+        reaches at its distance, so relative deviations from the curve are kept.
+        Appropriate when the border removes a roughly fixed *fraction* of every
+        node's value (residual spread proportional to the fitted curve), as for
+        counts, degrees or centralities truncated by a border.
+
+        Only meaningful for ratio-scale scores with a natural zero (counts,
+        degrees, centralities, expression) -- unlike the additive correction it
+        is not invariant to shifting the score by a constant, so do not use it
+        for e.g. z-scores or log-transformed values.
+
+        The factor plateau / S_model is defined only where S_model / plateau > 0
+        (curve and plateau of the same sign, non-zero). Elsewhere the corrected
+        value is NaN and a RuntimeWarning is issued; `multiplicative_n_undefined`
+        and `multiplicative_max_factor` record how many values were undefined and
+        the largest factor applied (large factors amplify noise near the border).
+
+        Returns self.S_corrected (expanded back to the original index).
+        """
+        if self._params is None:
+            raise RuntimeError("fit() must be called before correct()")
+        if not self._converged:
+            self._S_corrected = self._S_true
+            self._multiplicative_n_undefined = 0
+            self._multiplicative_max_factor = np.nan
+            return self.S_corrected
+        model = np.asarray(self.S_model, dtype=float)
+        ratio = model / self.plateau if self.plateau != 0 else np.full_like(model, np.nan)
+        defined = np.isfinite(ratio) & (ratio > 0)
+        factor = np.full_like(model, np.nan)
+        factor[defined] = 1.0 / ratio[defined]
+        self._multiplicative_n_undefined = int((~defined).sum())
+        self._multiplicative_max_factor = float(np.max(factor[defined])) if defined.any() else np.nan
+        if self._multiplicative_n_undefined:
+            warnings.warn(
+                f"{self.name}: multiplicative correction undefined for "
+                f"{self._multiplicative_n_undefined} of {len(model)} values "
+                f"(fitted curve and plateau not of the same sign, or zero); set to NaN.",
+                RuntimeWarning, stacklevel=2)
+        self._S_corrected = self._S_true * factor
+        return self.S_corrected
+
+    def suggest_correction_mode(self, max_excluded_fraction=0.1):
+        """Suggest "additive" or "multiplicative" correction from how the spread of
+        the data around the fitted curve changes with the curve's height.
+
+        Keeps the fitted mean curve f(d) fixed and compares two models for the
+        residuals by AIC (both Gaussian, one variance parameter each):
+          - additive:        constant spread, sd = sigma          (`log_likelihood`)
+          - multiplicative:  spread proportional to the curve, sd = sigma0 * |f(d)|
+                             (`proportional_log_likelihood`)
+        The comparison uses only points where the multiplicative factor is defined
+        (f(d) / plateau > 0), the same points for both models. If more than
+        `max_excluded_fraction` of the points are excluded, the suggestion falls
+        back to "additive". Constant and non-converged fits get "additive" (both
+        corrections are the identity there).
+
+        Also reports gamma, the slope of log|residual| on log|f(d)|: ~0 means
+        constant spread (additive), ~1 spread proportional to the curve
+        (multiplicative); descriptive only, not used for the decision.
+
+        Returns (and stores as self.correction_diagnostic) a dict with
+        correction_mode_suggested, variance_model_dAIC (AIC_multiplicative -
+        AIC_additive; negative favours multiplicative),
+        variance_model_scaled_rel_likelihood (exp(-dAIC / (2N)), multiplicative
+        over additive, for comparison across datasets), gamma,
+        n_used_for_diagnostic, fraction_excluded_from_diagnostic, diagnostic_note.
+        """
+        if self._params is None:
+            raise RuntimeError("fit() must be called before suggest_correction_mode()")
+        diag = {"correction_mode_suggested": "additive", "variance_model_dAIC": np.nan,
+                "variance_model_scaled_rel_likelihood": np.nan, "gamma": np.nan,
+                "n_used_for_diagnostic": 0, "fraction_excluded_from_diagnostic": np.nan,
+                "diagnostic_note": ""}
+        if not self._converged or isinstance(self, ConstantFit):
+            diag["diagnostic_note"] = "constant or non-converged fit: no border effect to correct"
+            self.correction_diagnostic = diag
+            return diag
+        y = np.asarray(self._S_true, dtype=float)
+        f = np.asarray(self.S_model, dtype=float)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = f / self.plateau
+        use = np.isfinite(ratio) & (ratio > 0)
+        diag["n_used_for_diagnostic"] = int(use.sum())
+        diag["fraction_excluded_from_diagnostic"] = float(1 - use.mean())
+        if use.sum() < 3 or diag["fraction_excluded_from_diagnostic"] > max_excluded_fraction:
+            diag["diagnostic_note"] = (f"multiplicative undefined for {diag['fraction_excluded_from_diagnostic']:.1%} "
+                                       f"of points (> {max_excluded_fraction:.0%}): additive")
+            self.correction_diagnostic = diag
+            return diag
+        y, f = y[use], f[use]
+        aic_add = akaike_information_criterion(1, log_likelihood(y, f))
+        aic_mult = akaike_information_criterion(1, proportional_log_likelihood(y, f))
+        diag["variance_model_dAIC"] = float(aic_mult - aic_add)
+        diag["variance_model_scaled_rel_likelihood"] = float(scaled_relative_likelihood(aic_mult, aic_add, len(y)))
+        diag["correction_mode_suggested"] = "multiplicative" if aic_mult < aic_add else "additive"
+        resid = np.abs(y - f)
+        ok = resid > 0
+        log_f = np.log(np.abs(f[ok]))
+        if ok.sum() >= 3 and np.ptp(log_f) > 0:
+            diag["gamma"] = float(np.polyfit(log_f, np.log(resid[ok]), 1)[0])
+        self.correction_diagnostic = diag
+        return diag
+
+    @property
+    def plateau(self):
+        """Value the fitted curve approaches away from the border -- the target
+        both corrections move every node to (e.g. a + c for exponential
+        saturation, m*b + c for piecewise linear, 0 for exponential decay).
+        NaN for a fit that failed to converge."""
+        if self._params is None:
+            raise RuntimeError("fit() must be called before plateau is available")
+        return float(self._plateau())
+
+    def _plateau(self):
+        """Subclasses return their model's plateau from self.params."""
+        raise NotImplementedError("Subclasses should implement this method")
+
+    @property
+    def multiplicative_n_undefined(self):
+        """Number of values the last multiplicative correction set to NaN (None before)."""
+        return self._multiplicative_n_undefined
+
+    @property
+    def multiplicative_max_factor(self):
+        """Largest factor plateau / S_model applied by the last multiplicative correction."""
+        return self._multiplicative_max_factor
 
     def predict(self, d):
         """
@@ -308,11 +481,12 @@ class Fit():
         """
         raise NotImplementedError("Subclasses should implement this method")
 
-    def fit_correct(self):
-        """Convenience method: fit the model and, if converged, return the corrected signal."""
+    def fit_correct(self, mode="additive"):
+        """Convenience method: fit the model and, if converged, return the corrected
+        signal (see `correct` for `mode`)."""
         self.fit()
         if self._converged:
-            self.correct()
+            self.correct(mode)
         return self.S_corrected
 
     def _rate_observed_metrics(self):
@@ -414,7 +588,19 @@ class ConstantFit(Fit):
         self._converged = True
         self._finalize_fit()
 
-    def correct(self):
+    def _plateau(self):
+        return self.params["constant_c"]
+
+    def correct_multiplicative(self):
+        """A constant has no border effect: identity, exactly as the additive correction."""
+        if self._params is None:
+            raise RuntimeError("fit() must be called before correct()")
+        self._S_corrected = self._S_true
+        self._multiplicative_n_undefined = 0
+        self._multiplicative_max_factor = 1.0
+        return self.S_corrected
+
+    def correct_additive(self):
         if self._params is None:
             raise RuntimeError("fit() must be called before correct()")
         self._S_corrected = self._S_true
@@ -562,7 +748,10 @@ class PiecewiseLinearFit(Fit):
 
         self._finalize_fit()
 
-    def correct(self):
+    def _plateau(self):
+        return self.params["piecewise_linear_m"] * self.params["piecewise_linear_b"] + self.params["piecewise_linear_c"]
+
+    def correct_additive(self):
         if self._params is None:
             raise RuntimeError("fit() must be called before correct()")
         if self._converged:
@@ -670,7 +859,10 @@ class ExponentialSaturationFit(Fit):
 
         self._finalize_fit()
 
-    def correct(self):
+    def _plateau(self):
+        return self.params["exponential_saturation_a"] + self.params["exponential_saturation_c"]
+
+    def correct_additive(self):
         if self._params is None:
             raise RuntimeError("fit() must be called before correct()")
         if self._converged:
@@ -789,7 +981,10 @@ class ExponentialDecayFit(Fit):
 
         self._finalize_fit()
 
-    def correct(self):
+    def _plateau(self):
+        return 0.0  # pure decay asymptotes to exactly 0
+
+    def correct_additive(self):
         if self._params is None:
             raise RuntimeError("fit() must be called before correct()")
         if self._converged:
@@ -900,7 +1095,10 @@ class MichaelisMentenFit(Fit):
         self._finalize_fit()
 
 
-    def correct(self):
+    def _plateau(self):
+        return self.params["michaelis_menten_a"] + self.params["michaelis_menten_c"]
+
+    def correct_additive(self):
         if self._params is None:
             raise RuntimeError("fit() must be called before correct()")
         if self._converged:

@@ -557,6 +557,7 @@ def correct_layer(
     key_added="bosperrus_corrected",
     border_key="border",
     copy=False,
+    correction="additive",
 ):
     """Correct each feature toward its exponential-saturation asymptote,
     fit independently per spatially-connected grid component (see
@@ -594,6 +595,12 @@ def correct_layer(
         for spots excluded by `n_counts_key`/`min_component_size`.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
+    correction : {"additive", "multiplicative", "auto"}, default "additive"
+        Passed to `Flow.flow()`: how each winning fit corrects its feature (see
+        `Fit.correct`; "auto" chooses per feature and component via
+        `Fit.suggest_correction_mode()`). Counts are ratio-scale, so
+        "multiplicative" is meaningful here; the default reproduces earlier
+        versions exactly.
 
     Returns
     -------
@@ -630,7 +637,7 @@ def correct_layer(
             distances=pd.Series(distance[mask], name="distance_to_border"),
             scores=scores,
         )
-        flow.flow(fits=[ConstantFit, ExponentialSaturationFit])
+        flow.flow(fits=[ConstantFit, ExponentialSaturationFit], correction=correction)
         corrected_cols = [f"BOSPERRUS corrected {g}" for g in adata.var_names]
         corrected[mask] = flow.observations[corrected_cols].to_numpy()
         fit_quality_by_component[int(label)] = flow.fit_quality

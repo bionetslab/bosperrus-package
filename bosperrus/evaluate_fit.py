@@ -1,6 +1,6 @@
 import numpy as np
 
-__all__ = ['log_likelihood', 'akaike_information_criterion', 'relative_likelihood',
+__all__ = ['log_likelihood', 'proportional_log_likelihood', 'akaike_information_criterion', 'relative_likelihood',
            'scaled_relative_likelihood', 'calculate_AIC_weight_entropy']
 
 def log_likelihood(C_true, C_pred):
@@ -11,6 +11,24 @@ def log_likelihood(C_true, C_pred):
     # rather than +inf or -inf, keeping AIC-based model selection well-defined.
     sigma2 = max(sigma2, np.finfo(float).tiny)
     return -0.5 * n * (np.log(2 * np.pi * sigma2) + 1)
+
+def proportional_log_likelihood(C_true, C_pred):
+    """Gaussian log-likelihood with residual spread proportional to the prediction:
+    residual_i ~ N(0, (sigma0 * |C_pred_i|)^2), sigma0^2 estimated by maximum
+    likelihood as mean((residual / C_pred)^2).
+
+    The counterpart of `log_likelihood` (constant spread) for a multiplicative
+    error model; both estimate one variance parameter, so their AICs on the same
+    points and the same C_pred are directly comparable. All C_pred must be
+    non-zero (the caller restricts to such points).
+    """
+    C_true = np.asarray(C_true, dtype=float)
+    C_pred = np.asarray(C_pred, dtype=float)
+    n = len(C_true)
+    scale2 = C_pred ** 2
+    sigma02 = max(np.mean((C_true - C_pred) ** 2 / scale2), np.finfo(float).tiny)
+    return -0.5 * (n * (np.log(2 * np.pi * sigma02) + 1) + np.sum(np.log(scale2)))
+
 
 def akaike_information_criterion(num_params, log_likelihood_model):
     return 2 * num_params - 2 * log_likelihood_model
