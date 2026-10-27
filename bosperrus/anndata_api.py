@@ -23,7 +23,7 @@ import pandas as pd
 
 from . import _readers
 from .distances import distance_to_grid_border, distance_to_mask
-from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
+from .fit import ConstantFit, PiecewiseLinearFit, RisingPiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, small_grid_holes
 from .image_masks import segment_tissue_from_rgb, segment_tissue_from_ssdna
 from .pipeline import Flow
@@ -374,6 +374,7 @@ def identify_analysis_buffer_from_filtered(
     key_added="analysis_buffer",
     border_key="border",
     max_hole_area_um2=1024.0,
+    rising_only=False,
     copy=False,
 ):
     """Flag spots within the piecewise-linear-fit elbow of the tissue border,
@@ -464,6 +465,11 @@ def identify_analysis_buffer_from_filtered(
         count as tissue for adjacency. Larger holes (vessels, lumens, tears)
         stay borders. See `small_grid_holes`. "rect" grids only; pass None to
         disable.
+    rising_only : bool, default False
+        Fit `RisingPiecewiseLinearFit` (m >= 0) instead of the unconstrained
+        `PiecewiseLinearFit`: the piecewise model can only rise from the border
+        and plateau, so a falling interior trend can't win and its best rising
+        shape (e.g. a narrow edge dip) is fitted instead.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -507,7 +513,7 @@ def identify_analysis_buffer_from_filtered(
             distances=pd.Series(distance[mask], name="distance_to_border"),
             scores=pd.DataFrame({score_name: score_values[mask]}),
         )
-        flow.flow(fits=[ConstantFit, PiecewiseLinearFit])
+        flow.flow(fits=[ConstantFit, RisingPiecewiseLinearFit if rising_only else PiecewiseLinearFit])
         best_fit = flow.best_fits[score_name]
         # A border effect means the score is depressed at the border and rises
         # into the tissue (m > 0). A winning piecewise fit that falls into the

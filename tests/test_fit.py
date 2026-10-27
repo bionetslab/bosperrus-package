@@ -19,6 +19,7 @@ from bosperrus.fit import (
     Fit,
     ConstantFit,
     PiecewiseLinearFit,
+    RisingPiecewiseLinearFit,
     ExponentialSaturationFit,
     ExponentialDecayFit,
     MichaelisMentenFit,
@@ -908,3 +909,30 @@ def test_piecewise_fit_is_exact_between_discrete_distances():
     sse_brute = _brute_force_sse(d, y, lambda dd, b: np.minimum(dd, b), np.linspace(0, 20, 20001))
     assert sse_fit <= sse_brute * (1 + 1e-9)
     assert 5.0 < fit.params["piecewise_linear_b"] < 6.0
+
+
+class TestRisingPiecewiseLinearFit:
+
+    def test_matches_unconstrained_on_rising_data(self):
+        d = make_series(np.linspace(0, 10, 200))
+        C = make_series(PiecewiseLinearFit.piecewise_plateau(d.values, b=5.0, m=2.0, c=1.0))
+        free, rising = PiecewiseLinearFit(C, d), RisingPiecewiseLinearFit(C, d)
+        free.fit(); rising.fit()
+        for k in ("piecewise_linear_b", "piecewise_linear_m", "piecewise_linear_c"):
+            assert rising.params[k] == pytest.approx(free.params[k])
+
+    def test_falling_data_gives_flat_fit(self):
+        d = make_series(np.linspace(0, 10, 200))
+        C = make_series(PiecewiseLinearFit.piecewise_plateau(d.values, b=5.0, m=-2.0, c=1.0))
+        f = RisingPiecewiseLinearFit(C, d)
+        f.fit()
+        assert f.params["piecewise_linear_m"] == 0.0
+        assert f.params["piecewise_linear_c"] == pytest.approx(C.mean())
+
+    def test_finds_narrow_dip_under_falling_trend(self):
+        d = np.linspace(0, 10, 500)
+        C = np.where(d < 1, 5 + 5 * d, 10.5 - 0.5 * d)  # rises over 1, then falls
+        f = RisingPiecewiseLinearFit(make_series(C), make_series(d))
+        f.fit()
+        assert f.params["piecewise_linear_m"] > 0
+        assert f.params["piecewise_linear_b"] < 2
