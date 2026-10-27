@@ -6,7 +6,7 @@ an extra, since it's common/light enough that gating it behind an extra
 would just be friction for the common case.
 """
 import numpy as np
-from matplotlib.colors import LogNorm
+import pandas as pd
 
 from .fit import ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 
@@ -34,9 +34,14 @@ FIT_PALETTE = {
 
 
 def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=100,
-             hist_kwargs=None, line_kwargs=None):
-    """2D histogram of `score` vs. `distance`, with a fitted model curve
-    overlaid on top.
+             quantiles=((0.05, 0.95), (0.25, 0.75)), band_colors=("0.88", "0.7"),
+             mean_kwargs=None, line_kwargs=None):
+    """`score` vs. `distance` summarised per distance bin -- quantile bands
+    (a "fan") and the mean -- with a fitted model curve overlaid on top.
+
+    The summary line is the mean, not the median: every bosperrus fit is a
+    least-squares fit, i.e. it models the mean score at each distance, so
+    with skewed scores (e.g. counts) a fit would look off against the median.
 
     Parameters
     ----------
@@ -58,19 +63,20 @@ def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=100,
         `n_grid` points spanning `[min(distance), max(distance)]`.
     n_grid : int, default 200
         Number of points in the default `d_grid`, if not given explicitly.
-    bins : int or (int, int), default 40
-        Passed to `ax.hist2d`.
-    hist_kwargs : dict, optional
-        Extra keyword arguments forwarded to `ax.hist2d` (e.g. `cmap`).
-        Defaults to a log-scale color norm (`LogNorm()`) -- bin counts in a
-        score-vs-distance histogram are typically heavily right-skewed (a
-        few dense bins, many sparse ones), so a linear norm crushes
-        everything but the densest bins down near the colormap's low end.
-        Pass `hist_kwargs={"norm": None}` (or any other `Normalize`) to
-        override.
+    bins : int or array-like, default 100
+        Distance bins: a number of equal-width bins over the data range, or
+        the bin edges. Points outside the edges are not summarised; empty
+        bins are skipped.
+    quantiles : sequence of (low, high), default ((0.05, 0.95), (0.25, 0.75))
+        Quantile bands per distance bin, drawn in this order (outer first).
+    band_colors : sequence of colors, default ("0.88", "0.7")
+        One fill color per band in `quantiles`.
+    mean_kwargs : dict, optional
+        Extra keyword arguments forwarded to `ax.plot` for the per-bin mean
+        (defaults: black, linewidth 1, label "mean").
     line_kwargs : dict, optional
         Extra keyword arguments forwarded to `ax.plot` for the fitted curve
-        (e.g. `color`, `linewidth`).
+        (e.g. `color`, `linewidth`). Drawn last, on top.
 
     Returns
     -------
@@ -85,11 +91,35 @@ def plot_fit(ax, distance, score, predict_fn, d_grid=None, n_grid=200, bins=100,
     distance, score = distance[valid], score[valid]
     if len(distance) == 0:
         raise ValueError("No finite (distance, score) pairs to plot.")
+    if len(band_colors) != len(quantiles):
+        raise ValueError(f"need one band color per quantile band, got {len(band_colors)} for {len(quantiles)}.")
 
-    hist_kwargs = dict(hist_kwargs or {})
-    hist_kwargs.setdefault("cmap", "Greys")
-    hist_kwargs.setdefault("norm", LogNorm())
-    ax.hist2d(distance, score, bins=bins, **hist_kwargs)
+    if isinstance(bins, (int, np.integer)):
+        edges = np.linspace(distance.min(), distance.max(), int(bins) + 1)
+        if edges[0] == edges[-1]:  # all distances equal: one bin around them
+            edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
+    else:
+        try:
+            edges = np.asarray(bins, dtype=float)
+        except ValueError:  # ragged, e.g. old 2-D hist2d bins [x_edges, y_edges]
+            edges = None
+        if edges is None or edges.ndim != 1 or len(edges) < 2:
+            raise ValueError("bins must be a number of bins or a 1-D array of at least 2 bin edges.")
+    inside = (distance >= edges[0]) & (distance <= edges[-1])
+    idx = np.clip(np.searchsorted(edges, distance[inside], side="right") - 1, 0, len(edges) - 2)
+    groups = pd.Series(score[inside]).groupby(idx)
+    centres = ((edges[:-1] + edges[1:]) / 2)
+    if len(idx):
+        x = centres[np.asarray(sorted(set(idx)))]
+        q = groups.quantile(sorted({v for band in quantiles for v in band})).unstack()
+        for (lo, hi), color in zip(quantiles, band_colors):
+            ax.fill_between(x, q[lo].to_numpy(), q[hi].to_numpy(), color=color, linewidth=0,
+                            label=f"{lo:.0%}-{hi:.0%}")
+        mean_kwargs = dict(mean_kwargs or {})
+        mean_kwargs.setdefault("color", "black")
+        mean_kwargs.setdefault("linewidth", 1)
+        mean_kwargs.setdefault("label", "mean")
+        ax.plot(x, groups.mean().to_numpy(), **mean_kwargs)
 
     if d_grid is None:
         d_grid = np.linspace(distance.min(), distance.max(), n_grid)

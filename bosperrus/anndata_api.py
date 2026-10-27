@@ -1012,7 +1012,7 @@ def plot_border_effect(adata, score, distance_key="distance_to_border", componen
     figsize : (float, float), optional
         Defaults to `(4 * ncols, 3 * nrows)`.
     **plot_fit_kwargs
-        Forwarded to `plotting.plot_fit` (e.g. `bins`, `hist_kwargs`, `line_kwargs`).
+        Forwarded to `plotting.plot_fit` (e.g. `bins`, `quantiles`, `line_kwargs`).
 
     Returns
     -------

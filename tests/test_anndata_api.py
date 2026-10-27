@@ -727,7 +727,7 @@ def test_plot_border_effect_one_subplot_per_component():
     n_components = len(adata.uns["analysis_buffer_fit"]["per_component"])
     assert n_components == 2
     lines_per_axes = [len(ax.get_lines()) for ax in fig.get_axes()]
-    assert sum(1 for n in lines_per_axes if n == 1) == n_components
+    assert sum(1 for n in lines_per_axes if n == 2) == n_components  # per-bin mean + fitted curve
     plt.close(fig)
 
 
@@ -754,5 +754,5 @@ def test_plot_border_effect_works_after_reused_string_components_key():
     identify_analysis_buffer_from_filtered(adata, score="score", grid_type="rect")
     fig = plot_border_effect(adata, score="score")
 
-    assert len(fig.get_axes()[0].get_lines()) == 1
+    assert len(fig.get_axes()[0].get_lines()) == 2  # per-bin mean + fitted curve
     plt.close(fig)
