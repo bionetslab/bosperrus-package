@@ -90,7 +90,7 @@ def _scale_grid(d, n=_N_B_GRID):
     d_min = d_pos.min() if len(d_pos) else d_max
     return np.logspace(np.log10(1e-3 * d_min), np.log10(1e3 * d_max), n)
 
-__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'ExponentialSaturationFit', 'ExponentialDecayFit', 'MichaelisMentenFit']
+__all__ = ['Fit', 'ConstantFit', 'PiecewiseLinearFit', 'RisingPiecewiseLinearFit', 'ExponentialSaturationFit', 'ExponentialDecayFit', 'MichaelisMentenFit']
 
 class Fit():
     color = "C1"
@@ -429,6 +429,7 @@ class ConstantFit(Fit):
 
 class PiecewiseLinearFit(Fit):
     color = "#0033FF"
+    rising_only = False  # True: constrain m >= 0 (see RisingPiecewiseLinearFit)
 
     def __init__(self, S_true: pd.DataFrame | pd.Series, d: pd.DataFrame | pd.Series):
         """
@@ -471,7 +472,8 @@ class PiecewiseLinearFit(Fit):
         (beta*q1 - 2*alpha*q2). Evaluating every interval's endpoints (and,
         with refine_fit=True, its b*) via cumulative sums gives the global
         optimum over all b in [min(d), max(d)] in O(n log n) -- no starting
-        guess, no local search."""
+        guess, no local search. With rising_only, m >= 0 is enforced exactly:
+        a knot whose best slope would be negative gets m = 0 (SSE = syy)."""
         d = np.asarray(self._d, dtype=float)
         y = np.asarray(self._S_true, dtype=float)
         order = np.argsort(d, kind="stable")
@@ -497,6 +499,8 @@ class PiecewiseLinearFit(Fit):
         def sse_at(bb):
             sxx = q0 + q1 * bb + q2 * bb ** 2
             sxy = alpha + beta * bb
+            if self.rising_only:
+                sxy = np.maximum(sxy, 0.0)
             ok = sxx > 1e-12 * np.maximum(1.0, B + g * bb ** 2)
             return np.where(ok, syy - sxy ** 2 / np.where(ok, sxx, 1.0), np.inf)
 
@@ -512,6 +516,8 @@ class PiecewiseLinearFit(Fit):
         which, j = np.unravel_index(np.argmin(sse), sse.shape)
         b_opt = float(cand_b[which][j])
         m_opt, c_opt, _ = _linear_solve(np.minimum(d, b_opt), y, intercept=True)
+        if self.rising_only and m_opt <= 0:  # no knot with a rising fit: flat
+            b_opt, m_opt, c_opt = float(uniq[-1]), 0.0, float(y.mean())
         C_fit = self.piecewise_plateau(d, b_opt, m_opt, c_opt)
         return b_opt, m_opt, c_opt, C_fit
 
@@ -577,6 +583,13 @@ class PiecewiseLinearFit(Fit):
         return self.piecewise_plateau(
             d, self._params["piecewise_linear_b"], self._params["piecewise_linear_m"], self._params["piecewise_linear_c"]
         )
+
+
+class RisingPiecewiseLinearFit(PiecewiseLinearFit):
+    """PiecewiseLinearFit constrained to m >= 0: the fit can only rise from
+    the border and then plateau. Data that fall into the interior get a flat
+    fit (m = 0), which then loses to ConstantFit by AIC."""
+    rising_only = True
 
 
 class ExponentialSaturationFit(Fit):
