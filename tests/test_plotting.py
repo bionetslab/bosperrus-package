@@ -2,7 +2,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
-from matplotlib.colors import LogNorm, Normalize
 
 from bosperrus.fit import (
     ConstantFit, PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit,
@@ -36,8 +35,8 @@ def test_plot_fit_draws_curve_matching_predict_fn():
     assert returned_ax is ax
 
     lines = ax.get_lines()
-    assert len(lines) == 1
-    line_x, line_y = lines[0].get_data()
+    assert len(lines) == 2  # per-bin mean, then the fitted curve on top
+    line_x, line_y = lines[-1].get_data()
     np.testing.assert_allclose(line_y, fit.predict(np.asarray(line_x)))
     plt.close(fig)
 
@@ -48,7 +47,7 @@ def test_plot_fit_ignores_non_finite_points():
 
     fig, ax = plt.subplots()
     plot_fit(ax, d, s, lambda x: np.zeros_like(x))
-    assert len(ax.collections) > 0  # hist2d drew something without error
+    assert len(ax.collections) > 0  # quantile bands drawn without error
     plt.close(fig)
 
 
@@ -71,7 +70,7 @@ def test_plot_fit_default_d_grid_spans_data_range():
     s = np.array([1.0, 2.0, 3.0])
     fig, ax = plt.subplots()
     plot_fit(ax, d, s, lambda x: x)
-    line_x, _ = ax.get_lines()[0].get_data()
+    line_x, _ = ax.get_lines()[-1].get_data()
     assert line_x.min() == pytest.approx(2.0)
     assert line_x.max() == pytest.approx(8.0)
     plt.close(fig)
@@ -83,7 +82,7 @@ def test_plot_fit_explicit_d_grid_used_verbatim():
     d_grid = np.array([0.0, 100.0])
     fig, ax = plt.subplots()
     plot_fit(ax, d, s, lambda x: x, d_grid=d_grid)
-    line_x, _ = ax.get_lines()[0].get_data()
+    line_x, _ = ax.get_lines()[-1].get_data()
     np.testing.assert_allclose(line_x, d_grid)
     plt.close(fig)
 
@@ -96,23 +95,49 @@ def test_plot_fit_sets_axis_labels():
     plt.close(fig)
 
 
-def test_plot_fit_defaults_to_log_norm_histogram():
-    rng = np.random.default_rng(0)
-    d = rng.uniform(0, 10, 500)
-    s = rng.normal(0, 1, 500)
+def test_plot_fit_mean_line_is_per_bin_mean():
+    d = np.array([0.1, 0.2, 0.9, 1.1, 1.8, 1.9])
+    s = np.array([1.0, 3.0, 2.0, 10.0, 20.0, 30.0])
     fig, ax = plt.subplots()
-    plot_fit(ax, d, s, lambda x: np.zeros_like(x))
-    quadmesh = ax.collections[0]
-    assert isinstance(quadmesh.norm, LogNorm)
+    plot_fit(ax, d, s, lambda x: np.zeros_like(x), bins=[0.0, 1.0, 2.0])
+    mean_x, mean_y = ax.get_lines()[0].get_data()
+    np.testing.assert_allclose(mean_x, [0.5, 1.5])
+    np.testing.assert_allclose(mean_y, [2.0, 20.0])
     plt.close(fig)
 
 
-def test_plot_fit_norm_overridable_via_hist_kwargs():
+def test_plot_fit_mean_differs_from_median_on_skewed_bin():
+    d = np.array([0.1, 0.2, 0.3, 0.4])
+    s = np.array([1.0, 1.0, 1.0, 101.0])
+    fig, ax = plt.subplots()
+    plot_fit(ax, d, s, lambda x: np.zeros_like(x), bins=[0.0, 1.0])
+    _, mean_y = ax.get_lines()[0].get_data()
+    np.testing.assert_allclose(mean_y, [26.0])
+    plt.close(fig)
+
+
+def test_plot_fit_one_band_per_quantile_pair():
     rng = np.random.default_rng(0)
     d = rng.uniform(0, 10, 500)
     s = rng.normal(0, 1, 500)
     fig, ax = plt.subplots()
-    plot_fit(ax, d, s, lambda x: np.zeros_like(x), hist_kwargs={"norm": None})
-    quadmesh = ax.collections[0]
-    assert isinstance(quadmesh.norm, Normalize) and not isinstance(quadmesh.norm, LogNorm)
+    plot_fit(ax, d, s, lambda x: np.zeros_like(x), bins=10)
+    assert len(ax.collections) == 2
+    plot_fit(ax, d, s, lambda x: np.zeros_like(x), bins=10, quantiles=[(0.1, 0.9)], band_colors=["0.8"])
+    assert len(ax.collections) == 3
+    plt.close(fig)
+
+
+def test_plot_fit_band_colors_must_match_quantiles():
+    fig, ax = plt.subplots()
+    with pytest.raises(ValueError, match="band color"):
+        plot_fit(ax, np.array([1.0, 2.0]), np.array([1.0, 2.0]), lambda x: x, band_colors=["0.8"])
+    plt.close(fig)
+
+
+def test_plot_fit_rejects_2d_bins():
+    fig, ax = plt.subplots()
+    with pytest.raises(ValueError, match="1-D"):
+        plot_fit(ax, np.array([1.0, 2.0]), np.array([1.0, 2.0]), lambda x: x,
+                 bins=[np.array([0.0, 1.0, 2.0]), np.array([0.0, 5.0])])
     plt.close(fig)
