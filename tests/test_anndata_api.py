@@ -7,8 +7,9 @@ import pytest
 
 anndata = pytest.importorskip("anndata", reason="anndata not installed")
 
+from bosperrus import _border_test
 from bosperrus.anndata_api import (
-    identify_analysis_buffer_from_filtered, correct_layer, plot_border_effect,
+    identify_analysis_buffer_from_filtered, interior_window_test, correct_layer, plot_border_effect,
 )
 from bosperrus.fit import PiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit
 
@@ -756,3 +757,155 @@ def test_plot_border_effect_works_after_reused_string_components_key():
 
     assert len(fig.get_axes()[0].get_lines()) == 2  # per-bin mean + fitted curve
     plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# max_fit_distance_um and interior_window_test
+
+def _edge_dip_adata(n_side=80, b=4.0, noise=0.3, seed=0):
+    """Square grid (bin size 1) with a narrow rising elbow at the border (knot b) and noise inside."""
+    adata, row, col = _rect_grid_adata(n_side)
+    d = _distance_to_nearest_edge(row, col, n_side)
+    rng = np.random.default_rng(seed)
+    adata.obs["score"] = PiecewiseLinearFit.piecewise_plateau(d, b, 1.0, 5.0) + rng.normal(0, noise, len(row))
+    return adata
+
+
+def test_max_fit_distance_restricts_fit():
+    adata = _edge_dip_adata()
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    d = adata.obs["distance_to_border"].to_numpy()
+    assert info["n_spots"] == int((d <= 10).sum())
+    assert info["max_fitted_distance_um"] <= 10
+    assert not adata.obs["analysis_buffer"].to_numpy()[d > 10].any()
+    assert np.isfinite(d).all()  # the distance column itself stays complete
+
+
+def test_interior_window_test_edge_dip_is_significant():
+    adata = _edge_dip_adata(n_side=100)  # 10 x fit depth: room for >= 19 windows
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+    buffer_before = adata.obs["analysis_buffer"].to_numpy().copy()
+    interior_window_test(adata)
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    assert info["border_effect"]
+    assert info["n_windows"] >= 19
+    assert info["p_value"] == pytest.approx(info["p_min"])  # steeper than every window
+    assert info["p_min"] == pytest.approx(1 / (info["n_windows"] + 1))
+    assert info["p_value"] <= 0.05 and info["significant"] and not info["buffer_dropped"]
+    np.testing.assert_array_equal(adata.obs["analysis_buffer"].to_numpy(), buffer_before)
+    assert adata.uns["analysis_buffer_test"]["window_size_um"] == 20
+
+
+def test_interior_window_test_drops_non_significant_buffer():
+    # alpha = 0: no p-value can pass, so the fitted buffer must be cleared (or kept with drop_non_significant=False)
+    for drop in (True, False):
+        adata = _edge_dip_adata()
+        identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+        assert adata.obs["analysis_buffer"].any()
+        with pytest.warns(UserWarning, match="smallest reachable p-value"):
+            interior_window_test(adata, min_windows=5, alpha=0.0, drop_non_significant=drop)
+        info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+        assert not info["significant"]
+        assert info["buffer_dropped"] is drop
+        assert adata.obs["analysis_buffer"].any() is not drop
+
+
+def test_interior_window_test_windows_stay_inside_own_component():
+    adata, row, col, block_a, n_side, gap = _two_block_adata(n_side=60, gap=100)
+    rng = np.random.default_rng(1)
+    d_a = _distance_to_nearest_edge(row, col, n_side)
+    d_b = _distance_to_nearest_edge(row, col, n_side, row_offset=gap)
+    d = np.where(block_a, d_a, d_b)
+    adata.obs["score"] = PiecewiseLinearFit.piecewise_plateau(d, 4.0, 1.0, 5.0) + rng.normal(0, 0.3, len(row))
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=8)
+    interior_window_test(adata, n_windows=25, min_windows=5, alpha=0.5)
+    size = 16
+    comp = adata.obs["components"].to_numpy()
+    dist = adata.obs["distance_to_border"].to_numpy()
+    for label, info in adata.uns["analysis_buffer_fit"]["per_component"].items():
+        assert 5 <= info["n_windows"] <= 25
+        corners = np.array([(w["row0"], w["col0"]) for w in info["windows"]])
+        for i in range(1, len(corners)):
+            assert _border_test.overlap_fraction(corners[i], corners[:i], size).max() <= 0.5
+        for w in info["windows"]:
+            in_win = ((row >= w["row0"]) & (row < w["row0"] + size) & (col >= w["col0"]) & (col < w["col0"] + size))
+            assert in_win.sum() == size * size
+            assert (comp[in_win] == label).all()
+            assert (dist[in_win] >= 8).all()
+
+
+def test_interior_window_test_too_few_windows_keeps_buffer():
+    adata = _edge_dip_adata(n_side=30)
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+    buffer_before = adata.obs["analysis_buffer"].to_numpy().copy()
+    with pytest.warns(UserWarning, match="interior windows of"):
+        interior_window_test(adata)
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    assert np.isnan(info["p_value"]) and not info["buffer_dropped"] and info["n_windows"] == 0
+    np.testing.assert_array_equal(adata.obs["analysis_buffer"].to_numpy(), buffer_before)
+
+
+def test_interior_window_test_is_seeded():
+    def windows(seed):
+        adata = _edge_dip_adata()
+        identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+        interior_window_test(adata, min_windows=5, alpha=0.5, seed=seed)
+        return [(w["row0"], w["col0"]) for w in adata.uns["analysis_buffer_fit"]["per_component"][0]["windows"]]
+    assert windows(3) == windows(3)
+    assert windows(3) != windows(4)
+
+
+def test_interior_window_test_skips_components_without_effect():
+    adata, row, col = _rect_grid_adata(80)
+    adata.obs["score"] = np.random.default_rng(0).normal(5, 0.3, len(row))
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True, max_fit_distance_um=10)
+    interior_window_test(adata)
+    info = adata.uns["analysis_buffer_fit"]["per_component"][0]
+    assert not info["border_effect"] and np.isnan(info["p_value"]) and info["windows"] == []
+
+
+def test_interior_window_test_needs_max_fit_distance():
+    adata = _edge_dip_adata()
+    identify_analysis_buffer_from_filtered(adata, score="score", rising_only=True)
+    with pytest.raises(ValueError, match="max_fit_distance_um"):
+        interior_window_test(adata)
+
+
+def test_window_corners_only_on_eligible_cells():
+    eligible = np.ones((6, 6), dtype=bool)
+    eligible[2, 3] = False
+    corners = _border_test.window_corners(eligible, 3)
+    for r, c in corners:
+        assert eligible[r:r + 3, c:c + 3].all()
+    assert len(corners) == 16 - sum(1 for r in range(4) for c in range(4) if r <= 2 <= r + 2 and c <= 3 <= c + 2)
+    assert len(_border_test.window_corners(eligible, 7)) == 0
+
+
+def test_window_p_value_rank():
+    null = np.array([0.01, 0.02, 0.0, 0.05])
+    assert _border_test.window_p_value(0.1, null) == pytest.approx(1 / 5)  # steeper than every window
+    assert _border_test.window_p_value(0.02, null) == pytest.approx(3 / 5)  # ties count as at least as steep
+    assert _border_test.window_p_value(0.0, null) == pytest.approx(5 / 5)
+    assert np.isnan(_border_test.window_p_value(0.1, []))
+
+
+def test_steepness():
+    rec = {"border_effect": True, "observed_effect_strength": -2.0, "half_life_um": 4.0}
+    assert _border_test.steepness(rec) == pytest.approx(0.5)
+    assert _border_test.steepness({**rec, "border_effect": False}) == 0.0
+    assert _border_test.steepness({**rec, "half_life_um": 1.0}, min_half_life_um=5.0) == pytest.approx(0.4)
+    assert _border_test.steepness(rec, min_half_life_um=2.0) == pytest.approx(0.5)  # above the floor: unchanged
+
+
+def test_spread_corners_caps_overlap_and_is_seeded():
+    corners = _border_test.window_corners(np.ones((60, 60), dtype=bool), 10)
+    for cap in (0.0, 0.25, 0.5):
+        chosen = _border_test.spread_corners(corners, 10, 100, cap, np.random.default_rng(0))
+        for i in range(1, len(chosen)):
+            assert _border_test.overlap_fraction(chosen[i], chosen[:i], 10).max() <= cap
+    assert len(_border_test.spread_corners(corners, 10, 100, 0.0, np.random.default_rng(0))) <= 25  # disjoint
+    a = _border_test.spread_corners(corners, 10, 100, 0.5, np.random.default_rng(1))
+    b = _border_test.spread_corners(corners, 10, 100, 0.5, np.random.default_rng(1))
+    np.testing.assert_array_equal(a, b)
+    assert len(_border_test.spread_corners(corners, 10, 3, 1.0, np.random.default_rng(0))) == 3

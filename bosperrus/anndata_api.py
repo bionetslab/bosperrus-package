@@ -21,7 +21,7 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from . import _readers
+from . import _border_test, _readers
 from .distances import distance_to_grid_border, distance_to_mask
 from .fit import ConstantFit, PiecewiseLinearFit, RisingPiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, small_grid_holes
@@ -30,7 +30,8 @@ from .pipeline import Flow
 from .plotting import plot_fit, FIT_PALETTE
 
 __all__ = [
-    "load_filtered", "identify_analysis_buffer_from_filtered", "correct_layer",
+    "load_filtered", "identify_analysis_buffer_from_filtered", "interior_window_test", "fit_border_profile",
+    "correct_layer",
     "quantify_diffusion_from_raw", "quantify_diffusion_visium_HD", "quantify_diffusion_stereoseq",
     "plot_border_effect",
 ]
@@ -360,6 +361,44 @@ def load_filtered(path, technology, resolution=8.0):
     return adata
 
 
+def fit_border_profile(distance, score, rising_only=False, score_name="score"):
+    """Fit one border profile: `ConstantFit` vs. `PiecewiseLinearFit` (or
+    `RisingPiecewiseLinearFit`) of `score` against `distance`, best by AIC.
+
+    The fit that `identify_analysis_buffer_from_filtered` runs per component and
+    `interior_window_test` runs per interior window. A border effect is a winning
+    piecewise fit that rises into the tissue (m > 0); a falling one is a trend,
+    not a border depression.
+
+    Returns the per-component record: `best_fit_type`, `border_effect`,
+    `elbow_um` (knot, None without a border effect), `params`,
+    `observed_effect_strength`, `observed_half_life` (normalised by the deepest
+    fitted distance), `half_life_um`, `max_fitted_distance_um`,
+    `affected_fraction` and `n_spots`.
+    """
+    distance = np.asarray(distance, dtype=float)
+    flow = Flow.from_distances_and_scores(
+        distances=pd.Series(distance, name="distance_to_border"),
+        scores=pd.DataFrame({score_name: np.asarray(score, dtype=float)}),
+    )
+    flow.flow(fits=[ConstantFit, RisingPiecewiseLinearFit if rising_only else PiecewiseLinearFit])
+    best_fit = flow.best_fits[score_name]
+    border_effect = isinstance(best_fit, PiecewiseLinearFit) and best_fit.params["piecewise_linear_m"] > 0
+    d_max = float(np.nanmax(distance))
+    return {
+        "best_fit_type": best_fit.name,
+        "border_effect": bool(border_effect),
+        "elbow_um": float(best_fit.params["piecewise_linear_b"]) if border_effect else None,
+        "params": dict(best_fit.params),
+        "observed_effect_strength": best_fit.observed_effect_strength,
+        "observed_half_life": best_fit.observed_half_life,
+        "half_life_um": float(best_fit.observed_half_life * d_max) if border_effect else None,
+        "max_fitted_distance_um": d_max,
+        "affected_fraction": best_fit.fraction_not_converged,
+        "n_spots": int(len(distance)),
+    }
+
+
 def identify_analysis_buffer_from_filtered(
     adata,
     score="n_counts",
@@ -375,6 +414,7 @@ def identify_analysis_buffer_from_filtered(
     border_key="border",
     max_hole_area_um2=1024.0,
     rising_only=False,
+    max_fit_distance_um=None,
     copy=False,
 ):
     """Flag spots within the piecewise-linear-fit elbow of the tissue border,
@@ -470,6 +510,13 @@ def identify_analysis_buffer_from_filtered(
         `PiecewiseLinearFit`: the piecewise model can only rise from the border
         and plateau, so a falling interior trend can't win and its best rising
         shape (e.g. a narrow edge dip) is fitted instead.
+    max_fit_distance_um : float, optional
+        Fit only spots at most this far from the border (in `bin_size_um`
+        units), so a narrow edge effect isn't swamped by tissue-scale gradients
+        deeper inside. Spots farther in are never in the buffer. None (default)
+        fits every spot. `interior_window_test` needs it: its interior windows
+        are squares of side 2 * `max_fit_distance_um`, so they span the same
+        range of distances as the fit.
     copy : bool, default False
         If True, return a modified copy of `adata` instead of mutating in place.
 
@@ -480,7 +527,9 @@ def identify_analysis_buffer_from_filtered(
         `adata.uns[f"{key_added}_fit"]` also records `max_hole_area_um2`,
         `n_filled_hole_bins` (rows kept only because they lie in a filled
         hole) and `filled_hole_positions` (`array_row`/`array_col`/
-        `components` of the hole positions without a row).
+        `components` of the hole positions without a row), and the call's
+        parameters (`params`) so `interior_window_test` can fit its interior
+        windows the same way.
     """
     _require_anndata()
     adata = adata.copy() if copy else adata
@@ -506,34 +555,14 @@ def identify_analysis_buffer_from_filtered(
         if label < 0:
             continue
         mask = (components == label) & np.isfinite(distance)
+        if max_fit_distance_um is not None:
+            mask &= distance <= max_fit_distance_um
         if not mask.any():
             continue
-
-        flow = Flow.from_distances_and_scores(
-            distances=pd.Series(distance[mask], name="distance_to_border"),
-            scores=pd.DataFrame({score_name: score_values[mask]}),
-        )
-        flow.flow(fits=[ConstantFit, RisingPiecewiseLinearFit if rising_only else PiecewiseLinearFit])
-        best_fit = flow.best_fits[score_name]
-        # A border effect means the score is depressed at the border and rises
-        # into the tissue (m > 0). A winning piecewise fit that falls into the
-        # tissue (m <= 0) is a real trend, but not a border artifact to buffer.
-        border_effect = (isinstance(best_fit, PiecewiseLinearFit)
-                         and best_fit.params["piecewise_linear_m"] > 0)
-        elbow_um = float(best_fit.params["piecewise_linear_b"]) if border_effect else None
-        if border_effect:
-            buffer[mask] = distance[mask] < elbow_um
-
-        per_component[int(label)] = {
-            "best_fit_type": best_fit.name,
-            "border_effect": bool(border_effect),
-            "elbow_um": elbow_um,
-            "params": dict(best_fit.params),
-            "observed_effect_strength": best_fit.observed_effect_strength,
-            "observed_half_life": best_fit.observed_half_life,
-            "affected_fraction": best_fit.fraction_not_converged,
-            "n_spots": int(mask.sum()),
-        }
+        info = fit_border_profile(distance[mask], score_values[mask], rising_only=rising_only, score_name=score_name)
+        if info["border_effect"]:
+            buffer[mask] = distance[mask] < info["elbow_um"]
+        per_component[int(label)] = info
 
     adata.obs[key_added] = buffer
     if n_counts_key is not None:
@@ -544,8 +573,214 @@ def identify_analysis_buffer_from_filtered(
         "grid_type": grid_type, "bin_size_um": bin_size_um, "per_component": per_component,
         "max_hole_area_um2": max_hole_area_um2, "n_filled_hole_bins": n_filled,
         "filled_hole_positions": virtual,
+        "params": {
+            "score": score_name if isinstance(score, str) else None, "row_key": row_key, "col_key": col_key,
+            "grid_type": grid_type, "n_counts_key": n_counts_key, "bin_size_um": bin_size_um,
+            "components_key": components_key, "distance_key": distance_key, "border_key": border_key,
+            "max_hole_area_um2": max_hole_area_um2, "rising_only": rising_only,
+            "max_fit_distance_um": max_fit_distance_um,
+        },
     }
 
+    return adata if copy else None
+
+
+def interior_window_test(
+    adata,
+    key_added="analysis_buffer",
+    score=None,
+    margin_um=None,
+    n_windows=200,
+    min_windows=19,
+    max_overlap=0.5,
+    min_half_life_um=0.0,
+    alpha=0.05,
+    drop_non_significant=True,
+    seed=0,
+    copy=False,
+):
+    """Test each component's border effect against interior windows of the same component.
+
+    Run after `identify_analysis_buffer_from_filtered` (with `max_fit_distance_um`).
+    For every component with a border effect (a rising piecewise-linear elbow),
+    square windows are placed inside that same component, away from its border,
+    and each window is fitted exactly like the border: the score against the
+    distance to the window's own edge, with the same fit models. A window has no
+    physical border, so any elbow found there comes from tissue structure. The
+    component's elbow is significant if it is steeper than the windows' elbows:
+    the statistic is -effect strength / half-life, the drop per um, which is
+    large only for a dip that is both deep and narrow (windows without a rising
+    elbow have steepness 0); p = (1 + #windows at least as steep) / (1 + #windows)
+    (see `bosperrus._border_test`).
+
+    Windows are squares of side 2 * `max_fit_distance_um` (rounded to whole
+    bins), so their distances span the same range as the border fit. A window
+    is valid if every grid position in it belongs to the component (positions
+    in filled holes count) and every spot in it is at least `margin_um` from the
+    component's border (by `distance_key`). Up to `n_windows` are drawn at
+    random from the valid positions such that no two share more than
+    `max_overlap` of their area.
+
+    Parameters
+    ----------
+    adata : AnnData
+        After `identify_analysis_buffer_from_filtered(..., max_fit_distance_um=...)`
+        with the same `key_added`; its components, distances and fit settings
+        are reused.
+    key_added : str, default "analysis_buffer"
+        The buffer to test (`adata.obs[key_added]`, `adata.uns[f"{key_added}_fit"]`).
+    score : array-like, optional
+        Only needed if the buffer was fitted on an array rather than an `.obs`
+        column: the same array.
+    margin_um : float, optional
+        Minimum distance of every window spot from the component's border.
+        Default: `max_fit_distance_um`, i.e. windows lie in the interior that
+        the border fit does not use.
+    n_windows : int, default 200
+        Maximum number of windows per component.
+    min_windows : int, default 19
+        Components where fewer windows fit (under the overlap cap) get
+        `p_value` NaN and a warning, and their buffer is kept as fitted. The
+        smallest reachable p-value is 1 / (n + 1), so 19 windows allow p = 0.05.
+        With the defaults (windows of side 2D for fit depth D, margin D,
+        max_overlap 0.5) a square component needs a side of roughly 8 D
+        (about 2 mm for D = 250 um).
+    max_overlap : float, default 0.5
+        Largest shared area fraction of any two windows (0: disjoint windows,
+        1: no cap).
+    min_half_life_um : float, default 0.0
+        Floor of the half-life in the steepness statistic, for the component
+        and its windows alike. A fit whose knot sits at the first bin has a
+        half-life of half a bin, so at fine bin sizes shallow one-bin steps in
+        the windows get extreme steepness. Set it to the precision of the
+        border (e.g. the tissue mask's pixel size).
+    alpha : float, default 0.05
+        Significance level.
+    drop_non_significant : bool, default True
+        Clear the buffer (`adata.obs[key_added]` = False) of components whose
+        border effect has `p_value > alpha`.
+    seed : int, default 0
+        Seeds the window placement (per component: `[seed, label]`).
+    copy : bool, default False
+        If True, return a modified copy of `adata` instead of mutating in place.
+
+    Returns
+    -------
+    AnnData or None
+        The modified AnnData if `copy=True`, else None. Each entry of
+        `adata.uns[f"{key_added}_fit"]["per_component"]` gains `p_value` (NaN
+        without a border effect or without enough windows), `significant`,
+        `buffer_dropped`, `steepness`, `n_windows`, `n_window_positions` (all
+        valid positions, before the overlap cap), `p_min` (1 / (n_windows + 1))
+        and `windows` (per window: grid offset `row0`/`col0`,
+        `effect_strength`, `half_life_um`, `steepness`). The test settings are stored in
+        `adata.uns[f"{key_added}_test"]`.
+    """
+    _require_anndata()
+    adata = adata.copy() if copy else adata
+    fit_key = f"{key_added}_fit"
+    if fit_key not in adata.uns or "params" not in adata.uns[fit_key]:
+        raise ValueError(f"adata.uns[{fit_key!r}] with fit params not found -- run "
+                         f"identify_analysis_buffer_from_filtered(..., key_added={key_added!r}) first.")
+    fit = adata.uns[fit_key]
+    prm = fit["params"]
+    if prm["grid_type"] != "rect":
+        raise NotImplementedError("Interior windows are only implemented for grid_type='rect'.")
+    if prm["max_fit_distance_um"] is None:
+        raise ValueError("The buffer was fitted without max_fit_distance_um; the interior windows need it "
+                         "(window side = 2 * max_fit_distance_um). Rerun identify_analysis_buffer_from_filtered "
+                         "with max_fit_distance_um.")
+    if prm["components_key"] is None or prm["distance_key"] is None:
+        raise ValueError("The buffer was fitted with components_key=None or distance_key=None; the test needs "
+                         "both columns in adata.obs.")
+    if score is None:
+        if prm["score"] is None:
+            raise ValueError("The buffer was fitted on an array score; pass the same array as `score`.")
+        score_values = adata.obs[prm["score"]].to_numpy(dtype=float)
+    else:
+        score_values = np.asarray(score, dtype=float)
+
+    bin_size = float(prm["bin_size_um"])
+    max_fit = float(prm["max_fit_distance_um"])
+    margin_um = max_fit if margin_um is None else float(margin_um)
+    if not 0 <= max_overlap <= 1:
+        raise ValueError(f"max_overlap must lie in [0, 1], got {max_overlap}.")
+    size = int(round(2 * max_fit / bin_size))
+    offsets = np.arange(size)
+    edge_steps = np.minimum(offsets, size - 1 - offsets)
+    window_distance = np.minimum.outer(edge_steps, edge_steps) * bin_size  # distance to the window's own edge
+
+    row = adata.obs[prm["row_key"]].to_numpy(dtype=np.int64)
+    col = adata.obs[prm["col_key"]].to_numpy(dtype=np.int64)
+    components = adata.obs[prm["components_key"]].to_numpy()
+    distance = adata.obs[prm["distance_key"]].to_numpy(dtype=float)
+    virtual = fit["filled_hole_positions"]
+    v_row = np.asarray(virtual["array_row"], dtype=np.int64)
+    v_col = np.asarray(virtual["array_col"], dtype=np.int64)
+    v_comp = np.asarray(virtual["components"])
+    buffer = adata.obs[key_added].to_numpy().copy()
+
+    for label, info in fit["per_component"].items():
+        label = int(label)
+        info.update(p_value=np.nan, p_min=np.nan, significant=False, buffer_dropped=False,
+                    steepness=_border_test.steepness(info, min_half_life_um), n_windows=0, n_window_positions=0,
+                    windows=[])
+        if not info["border_effect"]:
+            continue
+        member = np.flatnonzero(components == label)
+        vr, vc = v_row[v_comp == label], v_col[v_comp == label]
+        all_r, all_c = np.concatenate([row[member], vr]), np.concatenate([col[member], vc])
+        r0, c0 = all_r.min(), all_c.min()
+        shape = (all_r.max() - r0 + 1, all_c.max() - c0 + 1)
+        index = np.full(shape, -1, dtype=np.int64)  # adata row of each grid position (-1: none)
+        index[row[member] - r0, col[member] - c0] = member
+        eligible = np.zeros(shape, dtype=bool)
+        eligible[row[member] - r0, col[member] - c0] = distance[member] >= margin_um  # NaN compares False
+        eligible[vr - r0, vc - c0] = True  # filled hole positions without a spot
+        corners = _border_test.window_corners(eligible, size)
+        info["n_window_positions"] = int(len(corners))
+        rng = np.random.default_rng([seed, label])
+        chosen = _border_test.spread_corners(corners, size, n_windows, max_overlap, rng)
+        if len(chosen) < min_windows:
+            warnings.warn(
+                f"Component {label}: only {len(chosen)} interior windows of {size} bins fit at least "
+                f"{margin_um:g} um from the border with max_overlap={max_overlap:g} (< min_windows={min_windows}) "
+                f"-- p_value NaN, buffer kept as fitted.",
+                UserWarning, stacklevel=2,
+            )
+            continue
+        windows = []
+        for wr, wc in chosen:
+            idx = index[wr:wr + size, wc:wc + size]
+            spot = idx >= 0
+            values = score_values[idx[spot]]
+            ok = np.isfinite(values)
+            w = fit_border_profile(window_distance[spot][ok], values[ok], rising_only=prm["rising_only"])
+            eff, half = (float(w["observed_effect_strength"]), float(w["half_life_um"])) if w["border_effect"] \
+                else (np.nan, np.nan)
+            windows.append({"row0": int(wr + r0), "col0": int(wc + c0), "effect_strength": eff,
+                            "half_life_um": half, "steepness": _border_test.steepness(w, min_half_life_um)})
+        p = _border_test.window_p_value(info["steepness"], [w["steepness"] for w in windows])
+        p_min = 1 / (1 + len(windows))
+        if p_min > alpha:
+            warnings.warn(
+                f"Component {label}: with {len(windows)} windows the smallest reachable p-value is {p_min:.3g} "
+                f"> alpha={alpha:g}, so the border effect cannot be significant.",
+                UserWarning, stacklevel=2,
+            )
+        info.update(p_value=p, p_min=p_min, significant=bool(p <= alpha), n_windows=len(windows), windows=windows)
+        if drop_non_significant and p > alpha:
+            buffer[components == label] = False
+            info["buffer_dropped"] = True
+
+    adata.obs[key_added] = buffer
+    adata.uns[f"{key_added}_test"] = {
+        "method": "interior_windows", "window_size_um": size * bin_size, "margin_um": margin_um,
+        "statistic": "steepness", "min_half_life_um": min_half_life_um, "n_windows": n_windows,
+        "min_windows": min_windows, "max_overlap": max_overlap,
+        "alpha": alpha,
+        "drop_non_significant": drop_non_significant, "seed": seed,
+    }
     return adata if copy else None
 
 
