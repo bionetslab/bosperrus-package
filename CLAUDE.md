@@ -124,6 +124,12 @@ All functions return a named `pd.Series` with one distance value per node:
 
 `compute_centrality_measures(edge_list, N, measures, backend=None)` — dispatches to graph-tool if installed, else falls back to networkx (`HAS_GRAPH_TOOL`/`HAS_NETWORKX` flags checked at call time); `backend="graph_tool"` or `"networkx"` forces one explicitly. Only raises `ImportError` if the requested/available backend is truly missing. Supported measures: `"degree"`, `"pagerank"`, `"betweenness"`, `"closeness"`, `"harmonic"`, `"clustering"`. Isolated nodes (present in `N` but not in `edge_list`) are zero-padded so the output always has exactly `N` rows.
 
+### `anndata_api.py` (spatial transcriptomics, optional `anndata` extra)
+
+- `load_filtered(path, technology, resolution)` — per-bin totals of a Space Ranger / SAW tissue-filtered output.
+- `identify_analysis_buffer_from_filtered(adata, ..., rising_only, max_fit_distance_um)` — per connected grid component, `fit_border_profile` (constant vs. (rising) piecewise linear by AIC) of the score against distance to the component's border; buffer = spots closer than the knot of a rising fit. `max_fit_distance_um` restricts the fit to the outer band (distances stay complete in `.obs`). Settings land in `.uns[f"{key_added}_fit"]["params"]`.
+- `interior_window_test(adata, ...)` — tests each component's border effect against squares of side 2 * `max_fit_distance_um` placed inside the same component, at least `margin_um` (default `max_fit_distance_um`) from its border, fitted the same way against distance to the window edge. Statistic: steepness = -effect strength / max(half-life, `min_half_life_um`) (0 without a rising elbow; the floor stops one-bin knots at fine bin sizes from dominating); rank p-value (1 + #windows at least as steep) / (n + 1), so p_min = 1 / (n + 1) and `min_windows=19` allows p = 0.05. Windows are drawn so no two share more than `max_overlap` (default 0.5) of their area (`_border_test.spread_corners`); with the defaults a square component needs a side of about 8 × `max_fit_distance_um` (~2 mm at 250 µm). Non-significant buffers are cleared by default (`drop_non_significant=True`). rect grids only.
+
 ## Tests
 
 Tests live in `tests/test_fit.py` and cover all four `Fit` subclasses plus cross-model sanity checks. They do **not** require `graph-tool`. Test fixtures use `np.random.default_rng(42)` for reproducibility.
