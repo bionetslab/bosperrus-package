@@ -5,7 +5,9 @@ import pytest
 pytest.importorskip("skimage", reason="scikit-image not installed")
 anndata = pytest.importorskip("anndata", reason="anndata not installed")
 
-from bosperrus.image_masks import get_hires_image, segment_tissue_from_rgb, segment_tissue_from_ssdna, get_tissue_mask
+from bosperrus.image_masks import (
+    get_hires_image, get_tissue_mask, segment_tissue_from_he, segment_tissue_from_rgb, segment_tissue_from_ssdna,
+)
 
 
 def _synthetic_tissue_image(size=200, blob_slice=slice(60, 140)):
@@ -47,6 +49,56 @@ def test_segment_tissue_from_rgb_uniform_image_gives_empty_mask():
     image = np.full((100, 100, 3), 255, dtype=np.uint8)
     mask = segment_tissue_from_rgb(image, sigma=2, close_radius=3, min_hole_area=100, min_object_area=100)
     assert not mask.any()
+
+
+# ---------------------------------------------------------------------------
+# segment_tissue_from_he
+# ---------------------------------------------------------------------------
+
+def _synthetic_he_image(seed=0):
+    """Lavender glass, a stained tissue disk whose right half is pale, a glass hole inside the stained half."""
+    rng = np.random.default_rng(seed)
+    size = 300
+    yy, xx = np.mgrid[:size, :size]
+    image = np.empty((size, size, 3), dtype=float)
+    image[:] = (235, 230, 240)
+    disk_ = (yy - 150) ** 2 + (xx - 150) ** 2 < 100 ** 2
+    image[disk_] = (180, 80, 160)  # stained
+    pale = disk_ & (xx > 165)
+    image[pale] = (215, 185, 215)  # faint but stained
+    hole = (yy - 150) ** 2 + (xx - 100) ** 2 < 30 ** 2
+    image[hole] = (235, 230, 240)  # glass
+    image += rng.normal(0, 2, image.shape)
+    return np.clip(image, 0, 255).astype(np.uint8), disk_, pale, hole
+
+
+def test_segment_tissue_from_he_keeps_pale_tissue_and_open_holes():
+    image, disk_, pale, hole = _synthetic_he_image()
+    mask = segment_tissue_from_he(image, pixel_size_um=2.0)
+    assert mask.shape == image.shape[:2] and mask.dtype == bool
+    assert mask[150, 60]  # stained tissue
+    assert mask[150, 220]  # pale tissue joined to stained tissue
+    assert not mask[150, 100]  # glass hole (~11000 um^2) stays open
+    assert not mask[10, 10]  # background
+    assert (mask & disk_ & ~hole).sum() > 0.95 * (disk_ & ~hole).sum()
+
+
+def test_segment_tissue_from_he_without_growth_drops_pale_tissue():
+    image, *_ = _synthetic_he_image()
+    mask = segment_tissue_from_he(image, pixel_size_um=2.0, low_fraction=1.0)
+    assert mask[150, 60]
+    assert not mask[150, 220]
+
+
+def test_segment_tissue_from_he_fills_small_holes():
+    image, *_ = _synthetic_he_image()
+    mask = segment_tissue_from_he(image, pixel_size_um=2.0, min_hole_area_um2=20000)
+    assert mask[150, 100]
+
+
+def test_segment_tissue_from_he_uniform_image_gives_empty_mask():
+    image = np.full((100, 100, 3), 235, dtype=np.uint8)
+    assert not segment_tissue_from_he(image, pixel_size_um=2.0).any()
 
 
 # ---------------------------------------------------------------------------

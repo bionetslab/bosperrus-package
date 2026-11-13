@@ -25,7 +25,7 @@ from . import _border_test, _readers
 from .distances import distance_to_grid_border, distance_to_mask
 from .fit import ConstantFit, PiecewiseLinearFit, RisingPiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, small_grid_holes
-from .image_masks import segment_tissue_from_rgb, segment_tissue_from_ssdna
+from .image_masks import segment_tissue_from_he, segment_tissue_from_rgb, segment_tissue_from_ssdna
 from .pipeline import Flow
 from .plotting import plot_fit, FIT_PALETTE
 
@@ -952,7 +952,7 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
     """RNA diffusion outside an image-only tissue mask, for one Visium HD
     sample (see `quantify_diffusion_from_raw` for the returned quantities).
 
-    - Mask: `segment_tissue_from_rgb` on Space Ranger's own hires H&E image
+    - Mask: `segment_tissue_from_he` (default) or `segment_tissue_from_rgb` on Space Ranger's own hires H&E image
       (`square_{res}um/spatial/tissue_hires_image.png`) -- purely
       image-derived, unlike `tissue_positions.parquet`'s `in_tissue`.
     - Counts: `square_{res}um/raw_feature_bc_matrix.h5` summed over genes --
@@ -969,9 +969,12 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
         Space Ranger `binned_outputs/` directory.
     resolution : {2, 8, 16}, default 8
     mask_kwargs : dict, optional
-        Forwarded to `segment_tissue_from_rgb` (default: its own defaults --
-        single Otsu threshold after a sigma=8 blur, closing radius 10, holes
-        < 50000 px filled, objects < 3000 px removed).
+        `method`: "od" (default; `segment_tissue_from_he`: optical density
+        relative to the slide background, grown from stained into faint
+        tissue, holes >= 5000 um^2 kept; the image's pixel size is passed
+        in) or "brightness" (`segment_tissue_from_rgb`: one Otsu threshold
+        on blurred grey, holes < 50000 px filled). Everything else is
+        forwarded to that function.
     return_data : bool, default False
         See `quantify_diffusion_from_raw`.
     max_bins : int, default 2e8
@@ -982,10 +985,17 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
     bin_dir = _readers.visium_bin_dir(path, resolution)
 
     image = _readers.read_visium_hires_image(bin_dir)
-    mask = segment_tissue_from_rgb(image, **mask_kwargs)
     scalefactors = _readers.read_visium_scalefactors(bin_dir)
     scalef = float(scalefactors["tissue_hires_scalef"])
     mask_pixel_size_um = float(scalefactors["microns_per_pixel"]) / scalef
+    segment = dict(mask_kwargs)
+    method = segment.pop("method", "od")
+    if method == "od":
+        mask = segment_tissue_from_he(image, mask_pixel_size_um, **segment)
+    elif method == "brightness":
+        mask = segment_tissue_from_rgb(image, **segment)
+    else:
+        raise ValueError(f"mask_kwargs['method'] must be 'od' or 'brightness', got {method!r}.")
 
     barcodes, n_counts = _readers.read_10x_h5_total_counts(bin_dir / "raw_feature_bc_matrix.h5")
     _check_n_bins(len(barcodes), max_bins, resolution)
@@ -1129,8 +1139,9 @@ def quantify_diffusion_from_raw(path, technology, resolution=8.0, mask_kwargs=No
         Bin size (um). Visium HD: 2, 8 or 16. Stereo-seq: any integer
         multiple of 0.5 (pooled from bin1).
     mask_kwargs : dict, optional
-        Segmentation parameters, forwarded to `segment_tissue_from_rgb`
-        (Visium HD) or `segment_tissue_from_ssdna` (Stereo-seq).
+        Segmentation parameters: Visium HD see `quantify_diffusion_visium_HD`
+        (`segment_tissue_from_he` by default); Stereo-seq forwarded to
+        `segment_tissue_from_ssdna`.
     return_data : bool, default False
         Also return the per-bin data behind the fit (see Returns).
     max_bins : int, default 2e8

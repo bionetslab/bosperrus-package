@@ -17,7 +17,8 @@ folder).
 """
 import numpy as np
 
-__all__ = ["get_hires_image", "segment_tissue_from_rgb", "segment_tissue_from_ssdna", "get_tissue_mask"]
+__all__ = ["get_hires_image", "segment_tissue_from_rgb", "segment_tissue_from_he", "segment_tissue_from_ssdna",
+           "get_tissue_mask"]
 
 
 def _require_skimage():
@@ -143,6 +144,119 @@ def segment_tissue_from_rgb(image, sigma=8, close_radius=10, min_hole_area=50000
     mask = binary_closing(mask, disk(close_radius))
     mask = remove_small_holes(mask, area_threshold=min_hole_area)
     mask = remove_small_objects(mask, min_size=min_object_area)
+    return mask
+
+
+def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.0, edge_sigma_um=2.0, close_um=10.0,
+                           min_hole_area_um2=5000.0, min_object_area_um2=20000.0, frame=0.05,
+                           background_quantile=0.99, background_margin_um=50.0):
+    """Tissue mask of an H&E image from its optical density relative to the
+    slide background, grown from clearly stained tissue into faint tissue.
+
+    1. Background colour: median RGB of the image frame (outer `frame` of each
+       side), leaving out the darker half of a blurred-grey Otsu split (tissue
+       reaching into the frame).
+    2. Optical density OD = sum over RGB of max(0, -log10(I / background)),
+       capped at 1 (pen marks, frame lines), Gaussian-blurred twice: by
+       `sigma_um` to find and connect tissue (steps 3-4), and by
+       `edge_sigma_um` to place its edge (step 5), so the heavy blur does not
+       push the edge outwards.
+    3. Seeds: OD above its Otsu threshold, not touching the image border.
+    4. Growth: the seeds grow through every connected pixel with OD above
+       max(`low_fraction` x Otsu, the `background_quantile` of the frame
+       background), where the frame background leaves out pixels within
+       `background_margin_um` of seed-dense structures (tissue, frame lines).
+       Faint tissue joined to stained tissue is included; glass is not, so
+       holes and tears inside the tissue stay open.
+    5. Edge: the grown region is cut back to pixels whose lightly blurred OD
+       is above the same growth threshold.
+    6. Clean-up: closing (`close_um`), holes below `min_hole_area_um2` filled,
+       objects below `min_object_area_um2` removed, nothing touching the
+       image border.
+
+    Unlike `segment_tissue_from_rgb` (one Otsu threshold on brightness) this
+    keeps pale tissue whose brightness is close to the glass (e.g. pale
+    stroma, weakly stained cores) and does not fill real holes.
+
+    Parameters
+    ----------
+    image : np.ndarray
+        RGB image (uint8 or float in [0, 1]).
+    pixel_size_um : float
+        Image pixel size (um); all size parameters are in um.
+    low_fraction : float, default 0.25
+        Growth threshold as a fraction of the Otsu (seed) threshold; 1 turns
+        growth off. Raise it for very pale sections in stained haze, where
+        growth leaks into the background.
+    sigma_um : float, default 10
+        Blur sigma (um) for finding and connecting tissue.
+    edge_sigma_um : float, default 2
+        Blur sigma (um) for placing the tissue edge.
+    close_um : float, default 10
+        Closing-disk radius (um).
+    min_hole_area_um2 : float, default 5000
+        Holes smaller than this are filled (~80 um across).
+    min_object_area_um2 : float, default 20000
+        Objects smaller than this are removed.
+    frame : float, default 0.05
+        Width of the image frame used for the background, as a fraction of
+        each side.
+    background_quantile : float, default 0.99
+        Quantile of the frame background's OD that the growth threshold must
+        exceed.
+    background_margin_um : float, default 50
+        Frame pixels within this distance of seed-dense structures do not
+        count as background.
+
+    Returns
+    -------
+    np.ndarray of bool
+        Tissue mask, same shape as `image`'s first two dimensions.
+    """
+    _require_skimage()
+    from scipy import ndimage
+    from skimage.color import rgb2gray
+    from skimage.filters import gaussian, threshold_otsu
+    from skimage.morphology import binary_closing, disk, remove_small_holes, remove_small_objects
+    from skimage.segmentation import clear_border
+
+    rgb = np.asarray(image)[..., :3].astype(float)
+    if np.asarray(image).dtype == np.uint8:
+        rgb /= 255.0
+    um = float(pixel_size_um)
+    h, w = rgb.shape[:2]
+    in_frame = np.zeros((h, w), dtype=bool)
+    fh, fw = max(1, int(frame * h)), max(1, int(frame * w))
+    in_frame[:fh] = in_frame[-fh:] = True
+    in_frame[:, :fw] = in_frame[:, -fw:] = True
+
+    grey = gaussian(rgb2gray(rgb), sigma=sigma_um / um)
+    if np.ptp(grey) == 0:
+        return np.zeros((h, w), dtype=bool)
+    bright = grey >= threshold_otsu(grey)
+    bg_pixels = in_frame & bright if (in_frame & bright).any() else in_frame
+    background = np.median(rgb[bg_pixels], axis=0)
+
+    od_raw = np.clip(-np.log10(np.clip(rgb, 1e-3, None) / np.clip(background, 1e-3, None)), 0, None).sum(-1)
+    od_raw = np.minimum(od_raw, 1.0)
+    od = gaussian(od_raw, sigma=sigma_um / um)
+    od_edge = gaussian(od_raw, sigma=edge_sigma_um / um) if edge_sigma_um > 0 else od_raw
+    if np.ptp(od) == 0:
+        return np.zeros((h, w), dtype=bool)
+    high = threshold_otsu(od[::4, ::4])
+    dense = od > high
+    near_dense = ndimage.distance_transform_edt(~dense) * um < background_margin_um
+    frame_od = od[in_frame & ~near_dense]
+    low = low_fraction * high
+    if frame_od.size:
+        low = max(low, float(np.quantile(frame_od, background_quantile)))
+    low = min(low, high)
+
+    mask = ndimage.binary_propagation(clear_border(dense), mask=od > low)
+    mask = clear_border(mask) & (od_edge > low)
+    mask = binary_closing(mask, disk(max(1, int(round(close_um / um)))))
+    mask = remove_small_holes(mask, area_threshold=max(1, int(min_hole_area_um2 / um**2)))
+    mask = remove_small_objects(mask, min_size=max(1, int(min_object_area_um2 / um**2)))
     return mask
 
 
