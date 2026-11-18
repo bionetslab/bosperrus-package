@@ -21,9 +21,22 @@ __all__ = ['compute_centrality_measures']
 _VALID_MEASURES = {"degree", "pagerank", "betweenness", "closeness", "harmonic", "clustering"}
 
 
+def _undirected_edges(edge_list):
+    """Unique undirected (u, v) pairs with u <= v.
+
+    kNN edges come as directed tuples, so a mutual pair appears as both (u, v)
+    and (v, u). networkx's Graph merges these, but graph-tool's undirected Graph
+    keeps them as parallel edges, which double-counts the pair in degree and
+    breaks clustering (values > 1). Normalising here makes both backends treat
+    every input as the simple undirected graph (union of directions), as
+    squidpy's nx.Graph(A) does.
+    """
+    return sorted({tuple(sorted(e)) for e in edge_list})
+
+
 def _compute_with_graph_tool(edge_list, N, measures):
     g = Graph(directed=False)
-    g.add_edge_list(edge_list)
+    g.add_edge_list(_undirected_edges(edge_list))
 
     results = {}
     for m in measures:
@@ -56,7 +69,7 @@ def _compute_with_graph_tool(edge_list, N, measures):
 def _compute_with_networkx(edge_list, N, measures):
     G = nx.Graph()
     G.add_nodes_from(range(N))
-    G.add_edges_from(edge_list)
+    G.add_edges_from(_undirected_edges(edge_list))
 
     results = {}
     for m in measures:
