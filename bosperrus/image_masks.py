@@ -148,8 +148,8 @@ def segment_tissue_from_rgb(image, sigma=8, close_radius=10, min_hole_area=50000
 
 
 def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.0, edge_sigma_um=2.0, close_um=10.0,
-                           min_hole_area_um2=5000.0, min_object_area_um2=20000.0, frame=0.05,
-                           background_quantile=0.99, background_margin_um=50.0):
+                           min_hole_area_um2=50000.0, min_object_area_um2=50000.0, frame=0.05,
+                           background_quantile=0.99, background_margin_um=50.0, remove_border=True):
     """Tissue mask of an H&E image from its optical density relative to the
     slide background, grown from clearly stained tissue into faint tissue.
 
@@ -172,7 +172,7 @@ def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.
        is above the same growth threshold.
     6. Clean-up: closing (`close_um`), holes below `min_hole_area_um2` filled,
        objects below `min_object_area_um2` removed, nothing touching the
-       image border.
+       image border (steps 3 and 6 only with `remove_border`).
 
     Unlike `segment_tissue_from_rgb` (one Otsu threshold on brightness) this
     keeps pale tissue whose brightness is close to the glass (e.g. pale
@@ -194,9 +194,9 @@ def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.
         Blur sigma (um) for placing the tissue edge.
     close_um : float, default 10
         Closing-disk radius (um).
-    min_hole_area_um2 : float, default 5000
-        Holes smaller than this are filled (~80 um across).
-    min_object_area_um2 : float, default 20000
+    min_hole_area_um2 : float, default 50000
+        Holes smaller than this are filled (~250 um across).
+    min_object_area_um2 : float, default 50000
         Objects smaller than this are removed.
     frame : float, default 0.05
         Width of the image frame used for the background, as a fraction of
@@ -207,6 +207,11 @@ def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.
     background_margin_um : float, default 50
         Frame pixels within this distance of seed-dense structures do not
         count as background.
+    remove_border : bool, default True
+        Drop tissue touching the image border (Visium HD: the image extends
+        beyond the capture area, so this removes slide labels and frame
+        lines). Set False when the image is the capture area itself and the
+        section may run off it (STOmics/Stereo-seq chips).
 
     Returns
     -------
@@ -252,6 +257,9 @@ def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.
         low = max(low, float(np.quantile(frame_od, background_quantile)))
     low = min(low, high)
 
+    if not remove_border:
+        def clear_border(m):
+            return m
     mask = ndimage.binary_propagation(clear_border(dense), mask=od > low)
     mask = clear_border(mask) & (od_edge > low)
     mask = binary_closing(mask, disk(max(1, int(round(close_um / um)))))
@@ -260,11 +268,14 @@ def segment_tissue_from_he(image, pixel_size_um, low_fraction=0.25, sigma_um=10.
     return mask
 
 
-def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_radius=6, fill_holes=True):
+def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_radius=6, pixel_size_um=0.5,
+                              min_hole_area_um2=50000.0, min_object_area_um2=50000.0):
     """Tissue-vs-background segmentation for a single-channel fluorescence
     nucleic-acid stain (e.g. STOmics/Stereo-seq's `*_ssDNA_regist.tif`):
     block-mean downscale -> global threshold (tissue is *brighter* than the
-    background here, unlike H&E) -> morphological closing -> hole filling.
+    background here, unlike H&E) -> morphological closing -> holes below
+    `min_hole_area_um2` filled, objects below `min_object_area_um2` removed
+    (same size limits and defaults as `segment_tissue_from_he`).
 
     Segmentation runs on the downscaled image only -- a native ssDNA image is
     ~23k x 23k pixels, far too large (and far too textured) to threshold
@@ -286,8 +297,14 @@ def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_r
         the downscale factor is `max(1, round(max(image.shape) / target_size))`.
     close_radius : int, default 6
         Radius (downscaled pixels) of the morphological closing disk.
-    fill_holes : bool, default True
-        Fill enclosed holes after closing.
+    pixel_size_um : float, default 0.5
+        Native pixel size (um) of `image`; 0.5 = the Stereo-seq DNB pitch of
+        SAW's registered images. A mask pixel is `pixel_size_um * factor`.
+    min_hole_area_um2 : float, default 50000
+        Enclosed holes smaller than this are filled; larger ones (tears,
+        lumens, glass between tissue pieces) stay open.
+    min_object_area_um2 : float, default 50000
+        Objects smaller than this (dust, debris, small fragments) are removed.
 
     Returns
     -------
@@ -297,9 +314,8 @@ def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_r
         Integer downscale factor (native pixels per mask pixel, per axis).
     """
     _require_skimage()
-    from scipy.ndimage import binary_fill_holes
     from skimage.filters import threshold_multiotsu, threshold_otsu
-    from skimage.morphology import binary_closing, disk
+    from skimage.morphology import binary_closing, disk, remove_small_holes, remove_small_objects
     from skimage.transform import downscale_local_mean
 
     image = np.asarray(image)
@@ -316,8 +332,9 @@ def segment_tissue_from_ssdna(image, threshold="otsu", target_size=2000, close_r
         raise ValueError(f"threshold must be 'otsu' or 'multiotsu_top', got {threshold!r}.")
 
     mask = binary_closing(mask, disk(close_radius))
-    if fill_holes:
-        mask = binary_fill_holes(mask)
+    px_area_um2 = (pixel_size_um * factor) ** 2
+    mask = remove_small_holes(mask, area_threshold=max(1, int(min_hole_area_um2 / px_area_um2)))
+    mask = remove_small_objects(mask, min_size=max(1, int(min_object_area_um2 / px_area_um2)))
     return mask, factor
 
 

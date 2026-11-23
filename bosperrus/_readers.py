@@ -191,6 +191,19 @@ def pool_gef_counts(gef_path, dnbs_per_bin, extent):
     return dense.reshape(n_rows, n_cols)
 
 
-def read_ssdna_image(outs, sn):
+STEREOSEQ_STAINS = ("ssDNA", "DAPI", "HE")  # SAW's `{SN}_{stain}_regist.tif`, first found wins
+
+
+def read_stain_image(outs, sn):
+    """SAW's registered stain image (`outs/image/{SN}_{stain}_regist.tif`) and
+    its stain: "ssDNA" or "DAPI" (single-channel nucleic-acid fluorescence) or
+    "HE" (RGB)."""
     tifffile = _require("tifffile")
-    return tifffile.imread(Path(outs) / "image" / f"{sn}_ssDNA_regist.tif")
+    for stain in STEREOSEQ_STAINS:
+        path = Path(outs) / "image" / f"{sn}_{stain}_regist.tif"
+        if path.exists():
+            return tifffile.imread(path), stain
+    raise FileNotFoundError(
+        f"No registered stain image in {Path(outs) / 'image'}: expected {sn}_<stain>_regist.tif with stain in "
+        f"{STEREOSEQ_STAINS}."
+    )

@@ -74,7 +74,7 @@ def _synthetic_he_image(seed=0):
 
 def test_segment_tissue_from_he_keeps_pale_tissue_and_open_holes():
     image, disk_, pale, hole = _synthetic_he_image()
-    mask = segment_tissue_from_he(image, pixel_size_um=2.0)
+    mask = segment_tissue_from_he(image, pixel_size_um=2.0, min_hole_area_um2=5000)
     assert mask.shape == image.shape[:2] and mask.dtype == bool
     assert mask[150, 60]  # stained tissue
     assert mask[150, 220]  # pale tissue joined to stained tissue
@@ -165,7 +165,10 @@ def test_get_tissue_mask_combines_extraction_and_segmentation():
 
 def _synthetic_ssdna(size=400):
     """Dark background (20), a dim ring (80) around a bright core (200) --
-    tissue is brighter than background in a fluorescence stain."""
+    tissue is brighter than background in a fluorescence stain. At the
+    default 0.5 um per pixel the tissue disk is only ~0.018 mm^2, so tests
+    lower `min_object_area_um2` to keep it (and `min_hole_area_um2`, since
+    the whole background is smaller than the default)."""
     yy, xx = np.mgrid[:size, :size]
     r = np.hypot(yy - size / 2, xx - size / 2)
     image = np.full((size, size), 20, dtype=np.uint8)
@@ -177,7 +180,8 @@ def _synthetic_ssdna(size=400):
 def test_segment_tissue_from_ssdna_otsu_keeps_bright_region_at_downscaled_resolution():
     image, r = _synthetic_ssdna()
     image[r <= 150] = 200  # two levels only: background vs. tissue
-    mask, factor = segment_tissue_from_ssdna(image, target_size=100, close_radius=2)
+    mask, factor = segment_tissue_from_ssdna(image, target_size=100, close_radius=2, min_hole_area_um2=1000,
+                                             min_object_area_um2=1000)
     assert factor == 4
     assert mask.shape == (100, 100)
     # upsampled back, the mask matches the tissue disk up to a mask pixel
@@ -188,18 +192,28 @@ def test_segment_tissue_from_ssdna_otsu_keeps_bright_region_at_downscaled_resolu
 
 def test_segment_tissue_from_ssdna_multiotsu_top_keeps_only_brightest_class():
     image, r = _synthetic_ssdna()
-    mask, factor = segment_tissue_from_ssdna(image, threshold="multiotsu_top", target_size=100, close_radius=2)
+    mask, factor = segment_tissue_from_ssdna(image, threshold="multiotsu_top", target_size=100, close_radius=2,
+                                             min_hole_area_um2=1000, min_object_area_um2=1000)
     native = np.repeat(np.repeat(mask, factor, 0), factor, 1)
     assert native[r <= 70].all()
     assert not native[r >= 90].any()
 
 
-def test_segment_tissue_from_ssdna_fills_holes():
+def test_segment_tissue_from_ssdna_fills_small_holes_and_removes_small_objects():
     image, r = _synthetic_ssdna()
-    image[r <= 30] = 20  # dark hole in the middle of the tissue
-    filled, factor = segment_tissue_from_ssdna(image, target_size=100, close_radius=1)
-    holey, _ = segment_tissue_from_ssdna(image, target_size=100, close_radius=1, fill_holes=False)
-    assert filled[50, 50] and not holey[50, 50]
+    image[r <= 150] = 200
+    image[r <= 30] = 20  # dark hole of ~700 um^2 (radius 15 um at 0.5 um per pixel)
+    image[5:25, 5:25] = 200  # speck of 100 um^2 (tissue disk ~18000 um^2)
+    filled, factor = segment_tissue_from_ssdna(image, target_size=100, close_radius=1, min_hole_area_um2=1000,
+                                               min_object_area_um2=1000)
+    assert factor == 4
+    assert filled[50, 50]  # hole < 1000 um^2 filled
+    assert not filled[:8, :8].any()  # speck < 1000 um^2 removed
+    assert filled[50, 20]  # tissue kept
+    holey, _ = segment_tissue_from_ssdna(image, target_size=100, close_radius=1, min_hole_area_um2=100,
+                                         min_object_area_um2=10)
+    assert not holey[50, 50]  # hole > 100 um^2 stays open
+    assert holey[:8, :8].any()  # speck > 10 um^2 kept
 
 
 def test_segment_tissue_from_ssdna_rejects_unknown_threshold():
@@ -207,3 +221,11 @@ def test_segment_tissue_from_ssdna_rejects_unknown_threshold():
     with pytest.raises(ValueError, match="threshold"):
         segment_tissue_from_ssdna(image, threshold="triangle")
 
+
+
+def test_segment_tissue_from_he_remove_border_false_keeps_tissue_on_the_edge():
+    image = np.full((200, 200, 3), 240, np.uint8)
+    image[:, :80] = (200, 110, 170)  # section running off the left edge
+    assert not segment_tissue_from_he(image, pixel_size_um=2.0, min_object_area_um2=1000.0).any()
+    kept = segment_tissue_from_he(image, pixel_size_um=2.0, min_object_area_um2=1000.0, remove_border=False)
+    assert kept[:, :70].mean() > 0.95 and not kept[:, 100:].any()

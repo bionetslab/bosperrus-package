@@ -164,7 +164,7 @@ def _write_gef(path, x, y, count, whole_extent=None):
                 g.attrs[k] = np.array([v], dtype=np.uint32)
 
 
-def _make_saw(tmp_path, len_y=800, len_x=806, radius_dnb=150, sn="T00000A1"):
+def _make_saw(tmp_path, len_y=800, len_x=806, radius_dnb=150, sn="T00000A1", stain="ssDNA"):
     """0.5um DNBs; a bright tissue disk (radius 75um) on a dark ssDNA image;
     counts at 4um resolution (8x8 DNBs), one gef record per bin placed on the
     bin's first DNB (split into <=255 chunks for the uint8 count field).
@@ -176,8 +176,12 @@ def _make_saw(tmp_path, len_y=800, len_x=806, radius_dnb=150, sn="T00000A1"):
 
     cy, cx = len_y / 2, len_x / 2
     yy, xx = np.mgrid[:len_y, :len_x]
-    image = np.where(np.hypot(yy - cy, xx - cx) <= radius_dnb, 200, 20).astype(np.uint8)
-    tifffile.imwrite(outs / "image" / f"{sn}_ssDNA_regist.tif", image)
+    disk = np.hypot(yy - cy, xx - cx) <= radius_dnb
+    if stain == "HE":  # pink tissue on white glass
+        image = np.where(disk[..., None], np.array([200, 110, 170]), np.array([240, 240, 240])).astype(np.uint8)
+    else:  # bright nucleic-acid fluorescence on a dark chip
+        image = np.where(disk, 200, 20).astype(np.uint8)
+    tifffile.imwrite(outs / "image" / f"{sn}_{stain}_regist.tif", image)
 
     n = 8
     by, bx = np.mgrid[:len_y // n, :len_x // n]
@@ -225,7 +229,8 @@ def test_load_filtered_stereoseq_coarser_pooling_conserves_counts(tmp_path):
 def test_quantify_diffusion_stereoseq_recovers_decay_on_dense_grid(tmp_path):
     run, truth = _make_saw(tmp_path)
     result, data = quantify_diffusion_from_raw(
-        run, "stereo-seq", 4, mask_kwargs={"target_size": 200, "close_radius": 2}, return_data=True,
+        run, "stereo-seq", 4, mask_kwargs={"target_size": 200, "close_radius": 2, "min_object_area_um2": 1000.0},
+        return_data=True,
     )
 
     assert result["sn"] == truth["sn"]
@@ -238,6 +243,22 @@ def test_quantify_diffusion_stereoseq_recovers_decay_on_dense_grid(tmp_path):
     assert (data["n_counts"] == 0).any()
     assert result["mask_pixel_size_um"] == pytest.approx(0.5 * 4)  # factor = round(806 / 200) = 4
     np.testing.assert_allclose(data["distance_um"], truth["d_true"], atol=3.0)
+
+
+@pytest.mark.parametrize("stain,mask_kwargs", [
+    ("DAPI", {"target_size": 200, "close_radius": 2, "min_object_area_um2": 1000.0}),
+    ("HE", {"target_size": 200, "min_object_area_um2": 1000.0, "close_um": 2.0}),
+])
+def test_quantify_diffusion_stereoseq_other_stains(tmp_path, stain, mask_kwargs):
+    run, truth = _make_saw(tmp_path, stain=stain)
+    result, data = quantify_diffusion_from_raw(run, "stereo-seq", 4, mask_kwargs=mask_kwargs, return_data=True)
+
+    assert result["stain"] == stain
+    assert result["best_fit_type"] == "Exponential Decay Fit"
+    assert result["beta"] == pytest.approx(B_TRUE, rel=0.15)
+    assert result["mask_pixel_size_um"] == pytest.approx(0.5 * 4)
+    np.testing.assert_allclose(data["distance_um"], truth["d_true"], atol=4.0)
+    assert data["image"].ndim == (3 if stain == "HE" else 2)
 
 
 def test_quantify_diffusion_stereoseq_rejects_image_chip_mismatch(tmp_path):
@@ -283,3 +304,19 @@ def test_load_filtered_feeds_identify_analysis_buffer(tmp_path):
     identify_analysis_buffer_from_filtered(adata)
     assert adata.uns["analysis_buffer_fit"]["bin_size_um"] == 8.0
     assert "analysis_buffer" in adata.obs
+
+
+def test_drop_low_count_components_removes_only_whole_low_count_components():
+    from bosperrus.anndata_api import _drop_low_count_components
+    mask = np.zeros((20, 40), bool)
+    mask[2:18, 2:18] = True  # tissue
+    mask[5:10, 25:30] = True  # debris: almost no counts
+    mask[12:16, 34:38] = True  # beyond the bins: no bin centre
+    rr, cc = np.mgrid[:20, :32]
+    rows, cols = rr.ravel().astype(float), cc.ravel().astype(float)
+    counts = np.where((rows >= 2) & (rows < 18) & (cols >= 2) & (cols < 18), 100.0, 1.0)
+    out, n = _drop_low_count_components(mask, rows, cols, counts, 0.05)
+    assert n == 1
+    assert out[2:18, 2:18].all() and not out[5:10, 25:30].any() and out[12:16, 34:38].all()
+    same, n0 = _drop_low_count_components(mask, rows, cols, counts, 0.001)
+    assert n0 == 0 and (same == mask).all()
