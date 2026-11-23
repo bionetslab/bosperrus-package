@@ -25,7 +25,7 @@ from . import _border_test, _readers
 from .distances import distance_to_grid_border, distance_to_mask
 from .fit import ConstantFit, PiecewiseLinearFit, RisingPiecewiseLinearFit, ExponentialSaturationFit, ExponentialDecayFit, MichaelisMentenFit
 from .graph_construction import split_into_connected_components, find_grid_border, small_grid_holes
-from .image_masks import segment_tissue_from_rgb, segment_tissue_from_ssdna
+from .image_masks import segment_tissue_from_he, segment_tissue_from_rgb, segment_tissue_from_ssdna
 from .pipeline import Flow
 from .plotting import plot_fit, FIT_PALETTE
 
@@ -947,12 +947,36 @@ def _check_n_bins(n_bins, max_bins, resolution_um):
         )
 
 
+def _drop_low_count_components(mask, mask_row, mask_col, n_counts, min_fraction):
+    """Remove mask components whose mean counts per bin are below `min_fraction` x that of the component with the
+    most bins (debris, glass-edge artifacts and scratches the stain picked up). Components without any bin centre
+    (e.g. tissue beyond the capture area) are kept. Only whole components are removed -- the image alone still
+    places every edge. Returns (mask, n_dropped)."""
+    from scipy import ndimage
+    labels, n = ndimage.label(mask)
+    if n < 2:
+        return mask, 0
+    r, c = np.rint(mask_row).astype(np.int64), np.rint(mask_col).astype(np.int64)
+    inside = (r >= 0) & (r < mask.shape[0]) & (c >= 0) & (c < mask.shape[1])
+    comp = np.zeros(len(r), dtype=np.int64)
+    comp[inside] = labels[r[inside], c[inside]]
+    n_bins = np.bincount(comp, minlength=n + 1)[1:]
+    if n_bins.max() == 0:
+        return mask, 0
+    per_bin = np.bincount(comp, weights=np.asarray(n_counts, dtype=float), minlength=n + 1)[1:] / np.maximum(n_bins, 1)
+    reference = per_bin[np.argmax(n_bins)]
+    drop = (n_bins > 0) & (per_bin < min_fraction * reference)
+    if not drop.any():
+        return mask, 0
+    return mask & ~np.isin(labels, np.flatnonzero(drop) + 1), int(drop.sum())
+
+
 def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_data=False,
-                                 max_bins=_DEFAULT_MAX_BINS):
+                                 max_bins=_DEFAULT_MAX_BINS, min_component_counts_fraction=None):
     """RNA diffusion outside an image-only tissue mask, for one Visium HD
     sample (see `quantify_diffusion_from_raw` for the returned quantities).
 
-    - Mask: `segment_tissue_from_rgb` on Space Ranger's own hires H&E image
+    - Mask: `segment_tissue_from_he` (default) or `segment_tissue_from_rgb` on Space Ranger's own hires H&E image
       (`square_{res}um/spatial/tissue_hires_image.png`) -- purely
       image-derived, unlike `tissue_positions.parquet`'s `in_tissue`.
     - Counts: `square_{res}um/raw_feature_bc_matrix.h5` summed over genes --
@@ -969,12 +993,17 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
         Space Ranger `binned_outputs/` directory.
     resolution : {2, 8, 16}, default 8
     mask_kwargs : dict, optional
-        Forwarded to `segment_tissue_from_rgb` (default: its own defaults --
-        single Otsu threshold after a sigma=8 blur, closing radius 10, holes
-        < 50000 px filled, objects < 3000 px removed).
+        `method`: "od" (default; `segment_tissue_from_he`: optical density
+        relative to the slide background, grown from stained into faint
+        tissue, holes < 50000 um^2 filled, objects < 50000 um^2 removed;
+        the image's pixel size is passed in) or "brightness" (`segment_tissue_from_rgb`: one Otsu threshold
+        on blurred grey, holes < 50000 px filled). Everything else is
+        forwarded to that function.
     return_data : bool, default False
         See `quantify_diffusion_from_raw`.
     max_bins : int, default 2e8
+        See `quantify_diffusion_from_raw`.
+    min_component_counts_fraction : float, optional
         See `quantify_diffusion_from_raw`.
     """
     technology, resolution, _ = _readers.validate_technology_and_resolution("visium_hd", resolution)
@@ -982,16 +1011,26 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
     bin_dir = _readers.visium_bin_dir(path, resolution)
 
     image = _readers.read_visium_hires_image(bin_dir)
-    mask = segment_tissue_from_rgb(image, **mask_kwargs)
     scalefactors = _readers.read_visium_scalefactors(bin_dir)
     scalef = float(scalefactors["tissue_hires_scalef"])
     mask_pixel_size_um = float(scalefactors["microns_per_pixel"]) / scalef
+    segment = dict(mask_kwargs)
+    method = segment.pop("method", "od")
+    if method == "od":
+        mask = segment_tissue_from_he(image, mask_pixel_size_um, **segment)
+    elif method == "brightness":
+        mask = segment_tissue_from_rgb(image, **segment)
+    else:
+        raise ValueError(f"mask_kwargs['method'] must be 'od' or 'brightness', got {method!r}.")
 
     barcodes, n_counts = _readers.read_10x_h5_total_counts(bin_dir / "raw_feature_bc_matrix.h5")
     _check_n_bins(len(barcodes), max_bins, resolution)
     positions = _readers.read_visium_positions(bin_dir, barcodes)
     mask_row = positions["pxl_row_in_fullres"].to_numpy(dtype=float) * scalef
     mask_col = positions["pxl_col_in_fullres"].to_numpy(dtype=float) * scalef
+    n_dropped = 0
+    if min_component_counts_fraction is not None:
+        mask, n_dropped = _drop_low_count_components(mask, mask_row, mask_col, n_counts, min_component_counts_fraction)
 
     # pad so every bin centre falls inside the (padded) mask: distance_to_mask
     # clips out-of-range coordinates onto the edge, which would give bins
@@ -1009,7 +1048,8 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
     result, best_fit = _fit_diffusion(distance_um, n_counts, resolution)
     result = {"technology": technology, "path": str(path), **result,
               "mask_kwargs": mask_kwargs, "mask_pixel_size_um": mask_pixel_size_um,
-              "mask_tissue_fraction": float(mask.mean())}
+              "mask_tissue_fraction": float(mask.mean()),
+              "min_component_counts_fraction": min_component_counts_fraction, "n_components_dropped": n_dropped}
     if not return_data:
         return result
     data = {
@@ -1022,16 +1062,65 @@ def quantify_diffusion_visium_HD(path, resolution=8.0, mask_kwargs=None, return_
     return result, data
 
 
+def _he_scan_area(rgb, pixel_size_um, inset_um=20.0):
+    """Scanned glass of a STOmics H&E chip image: SAW pads the registered image
+    with black and scanners leave a dark vignette around the chip, which the
+    H&E mask would take for stained tissue. The glass is the largest connected
+    region brighter than 85% of the glass's grey level; the scan area is its
+    convex hull (the chip is a rectangle), inset by `inset_um`. Returns the
+    scan-area mask and the median glass colour."""
+    from scipy import ndimage
+    from skimage.filters import threshold_otsu
+    from skimage.morphology import convex_hull_image
+
+    grey = ndimage.gaussian_filter(rgb.mean(-1), 2)
+    lit = grey > 0.1
+    glass_grey = np.median(grey[lit & (grey >= threshold_otsu(grey[lit]))])
+    labels, _ = ndimage.label(grey > 0.85 * glass_grey)
+    glass = labels == np.argmax(np.bincount(labels.ravel())[1:]) + 1
+    scan = ndimage.binary_erosion(convex_hull_image(glass), iterations=max(1, int(round(inset_um / pixel_size_um))))
+    return scan, np.median(rgb[glass], axis=0)
+
+
+def _block_mean_rgb(image, factor, rows_per_chunk=1024):
+    """Block mean of an (H, W, >=3) uint8 or [0, 1] float image over factor x factor
+    pixels (partial blocks at the far edges averaged over what exists), in strips
+    so a ~20k x 40k RGB chip image never exists as float at once. Returns float32
+    RGB in [0, 1]."""
+    rgb = image[..., :3]
+    scale = 255.0 if rgb.dtype == np.uint8 else 1.0
+    h, w = rgb.shape[:2]
+    n_rows, n_cols = -(-h // factor), -(-w // factor)
+    col_n = np.bincount(np.arange(w) // factor, minlength=n_cols).astype(np.float64)
+    col_starts = np.arange(0, w, factor)
+    out = np.empty((n_rows, n_cols, 3), dtype=np.float32)
+    step = max(1, rows_per_chunk // factor) * factor
+    for r0 in range(0, h, step):
+        strip = rgb[r0:r0 + step].astype(np.float64)
+        row_starts = np.arange(0, strip.shape[0], factor)
+        summed = np.add.reduceat(np.add.reduceat(strip, col_starts, axis=1), row_starts, axis=0)
+        row_n = np.bincount(np.arange(strip.shape[0]) // factor).astype(np.float64)
+        out[r0 // factor:r0 // factor + len(row_starts)] = (
+            summed / (row_n[:, None, None] * col_n[None, :, None]) / scale
+        )
+    return out
+
+
 def quantify_diffusion_stereoseq(path, resolution=8.0, mask_kwargs=None, return_data=False,
-                                 max_bins=_DEFAULT_MAX_BINS):
+                                 max_bins=_DEFAULT_MAX_BINS, min_component_counts_fraction=None):
     """RNA diffusion outside an image-only tissue mask, for one Stereo-seq
     (STOmics) sample (see `quantify_diffusion_from_raw` for the returned
     quantities).
 
-    - Mask: `segment_tissue_from_ssdna` on SAW's registered ssDNA image
-      (`outs/image/{SN}_ssDNA_regist.tif`) -- purely image-derived, unlike
-      SAW's own `*_tissue_cut.tif`, whose tissuecut step also takes per-DNB
-      read counts as input.
+    - Mask: on SAW's registered stain image (`outs/image/{SN}_{stain}_regist.tif`,
+      first of ssDNA, DAPI, HE found) -- purely image-derived, unlike SAW's
+      own `*_tissue_cut.tif`, whose tissuecut step also takes per-DNB read
+      counts as input. ssDNA / DAPI (nucleic-acid fluorescence):
+      `segment_tissue_from_ssdna`. HE: block-mean downscale to ~`target_size`
+      (default 2000) px on the long edge, then `segment_tissue_from_he` with
+      `remove_border=False` (the image is the chip, and sections may run off
+      it), inside the scanned glass only (`_he_scan_area`: SAW's black
+      padding and the scanner's dark vignette count as glass).
     - Counts: `outs/feature_expression/{SN}.raw.gef` (bin1, the whole chip),
       pooled to `resolution` by floor division like SAW's own binN, on the
       dense chip grid -- zero-count bins included (a gef only lists DNBs
@@ -1050,11 +1139,14 @@ def quantify_diffusion_stereoseq(path, resolution=8.0, mask_kwargs=None, return_
         Any integer multiple of the 0.5um DNB pitch (e.g. 8 = 16x16 DNBs,
         10 = SAW bin20).
     mask_kwargs : dict, optional
-        Forwarded to `segment_tissue_from_ssdna` (default: its own defaults --
-        single Otsu on a ~2000 px downscale, closing disk 6, holes filled).
+        Forwarded to `segment_tissue_from_ssdna` (ssDNA / DAPI; default: its own
+        defaults -- single Otsu on a ~2000 px downscale, closing disk 6, holes
+        < 50000 um^2 filled, objects < 50000 um^2 removed) or `segment_tissue_from_he` (HE; plus `target_size`).
     return_data : bool, default False
         See `quantify_diffusion_from_raw`.
     max_bins : int, default 2e8
+        See `quantify_diffusion_from_raw`.
+    min_component_counts_fraction : float, optional
         See `quantify_diffusion_from_raw`.
     """
     technology, resolution, dnbs_per_bin = _readers.validate_technology_and_resolution("stereo-seq", resolution)
@@ -1064,18 +1156,37 @@ def quantify_diffusion_stereoseq(path, resolution=8.0, mask_kwargs=None, return_
     min_y, min_x, len_y, len_x = extent
     _check_n_bins((len_y // dnbs_per_bin) * (len_x // dnbs_per_bin), max_bins, resolution)
 
-    image = _readers.read_ssdna_image(outs, sn)
-    if image.shape != (len_y, len_x):
+    image, stain = _readers.read_stain_image(outs, sn)
+    if image.shape[:2] != (len_y, len_x):
         raise ValueError(
-            f"{sn}_ssDNA_regist.tif has shape {image.shape}, but the chip's DNB grid is "
+            f"{sn}_{stain}_regist.tif has shape {image.shape}, but the chip's DNB grid is "
             f"{(len_y, len_x)} -- can't map bins onto the image."
         )
-    mask, factor = segment_tissue_from_ssdna(image, **mask_kwargs)
     small_image = None
-    if return_data:
-        from skimage.transform import downscale_local_mean
-        small_image = downscale_local_mean(image, (factor, factor))
-    del image
+    if stain == "HE":
+        if image.ndim != 3:
+            raise ValueError(f"{sn}_HE_regist.tif has shape {image.shape}; expected an RGB image.")
+        target_size = mask_kwargs.pop("target_size", 2000)
+        factor = max(1, int(round(max(image.shape[:2]) / target_size)))
+        small_rgb = _block_mean_rgb(image, factor)
+        del image
+        pixel_um = _readers.STEREOSEQ_DNB_PITCH_UM * factor
+        scan, glass_rgb = _he_scan_area(small_rgb, pixel_um)
+        filled = small_rgb.copy()
+        filled[~scan] = glass_rgb  # padding / scanner vignette -> plain glass
+        mask = segment_tissue_from_he(filled, pixel_um, **{"remove_border": False, **mask_kwargs}) & scan
+        del filled
+        mask_kwargs["target_size"] = target_size
+        if return_data:
+            small_image = small_rgb
+    else:
+        if image.ndim != 2:
+            raise ValueError(f"{sn}_{stain}_regist.tif has shape {image.shape}; expected a single-channel image.")
+        mask, factor = segment_tissue_from_ssdna(image, **mask_kwargs)
+        if return_data:
+            from skimage.transform import downscale_local_mean
+            small_image = downscale_local_mean(image, (factor, factor))
+        del image
     mask_pixel_size_um = _readers.STEREOSEQ_DNB_PITCH_UM * factor
 
     dense = _readers.pool_gef_counts(outs / "feature_expression" / f"{sn}.raw.gef", dnbs_per_bin, extent)
@@ -1089,14 +1200,18 @@ def quantify_diffusion_stereoseq(path, resolution=8.0, mask_kwargs=None, return_
     half_bin, half_px = (dnbs_per_bin - 1) / 2, (factor - 1) / 2
     mask_row = (array_row * dnbs_per_bin + half_bin - half_px) / factor
     mask_col = (array_col * dnbs_per_bin + half_bin - half_px) / factor
+    n_dropped = 0
+    if min_component_counts_fraction is not None:
+        mask, n_dropped = _drop_low_count_components(mask, mask_row, mask_col, n_counts, min_component_counts_fraction)
     distance_um = distance_to_mask(
         np.stack([mask_row, mask_col], axis=1), mask, pixel_size_um=mask_pixel_size_um,
     ).to_numpy()
 
     result, best_fit = _fit_diffusion(distance_um, n_counts, resolution)
     result = {"technology": technology, "path": str(path), "sn": sn, **result,
-              "mask_kwargs": mask_kwargs, "mask_pixel_size_um": mask_pixel_size_um,
-              "mask_tissue_fraction": float(mask.mean())}
+              "stain": stain, "mask_kwargs": mask_kwargs, "mask_pixel_size_um": mask_pixel_size_um,
+              "mask_tissue_fraction": float(mask.mean()),
+              "min_component_counts_fraction": min_component_counts_fraction, "n_components_dropped": n_dropped}
     if not return_data:
         return result
     data = {
@@ -1108,7 +1223,7 @@ def quantify_diffusion_stereoseq(path, resolution=8.0, mask_kwargs=None, return_
 
 
 def quantify_diffusion_from_raw(path, technology, resolution=8.0, mask_kwargs=None, return_data=False,
-                                max_bins=_DEFAULT_MAX_BINS):
+                                max_bins=_DEFAULT_MAX_BINS, min_component_counts_fraction=None):
     """Quantify RNA diffusion outside the tissue from a pipeline's *raw*
     (whole capture area, unfiltered) output and an image-only tissue mask.
 
@@ -1129,13 +1244,20 @@ def quantify_diffusion_from_raw(path, technology, resolution=8.0, mask_kwargs=No
         Bin size (um). Visium HD: 2, 8 or 16. Stereo-seq: any integer
         multiple of 0.5 (pooled from bin1).
     mask_kwargs : dict, optional
-        Segmentation parameters, forwarded to `segment_tissue_from_rgb`
-        (Visium HD) or `segment_tissue_from_ssdna` (Stereo-seq).
+        Segmentation parameters: Visium HD see `quantify_diffusion_visium_HD`
+        (`segment_tissue_from_he` by default); Stereo-seq forwarded to
+        `segment_tissue_from_ssdna`.
     return_data : bool, default False
         Also return the per-bin data behind the fit (see Returns).
     max_bins : int, default 2e8
         Refuse to build a capture-area grid larger than this (every bin is
         held in memory and fit individually).
+    min_component_counts_fraction : float, optional
+        If given, mask components whose mean counts per bin are below this
+        fraction of the largest component's (by bins) are removed before
+        distances are computed (debris, glass-edge artifacts); components
+        without bins (tissue beyond the capture area) are kept. Whole
+        components only -- edges stay image-derived.
 
     Returns
     -------
@@ -1148,7 +1270,8 @@ def quantify_diffusion_from_raw(path, technology, resolution=8.0, mask_kwargs=No
         `perc_counts_outside` (counts-weighted: % of all counts outside the
         mask), `n_bins_total`, `n_bins_outside`, `n_counts_total`,
         `n_counts_outside`, `mask_kwargs`, `mask_pixel_size_um`,
-        `mask_tissue_fraction` (plus `sn` for Stereo-seq).
+        `mask_tissue_fraction`, `min_component_counts_fraction`,
+        `n_components_dropped` (plus `sn` and `stain` for Stereo-seq).
     data : dict, only if `return_data=True`
         `image` (the image exactly as segmented: Visium hires RGB, or the
         downscaled Stereo-seq ssDNA), `mask`, `mask_pixel_size_um`, per-bin
@@ -1159,7 +1282,8 @@ def quantify_diffusion_from_raw(path, technology, resolution=8.0, mask_kwargs=No
     """
     technology, _, _ = _readers.validate_technology_and_resolution(technology, resolution)
     fn = quantify_diffusion_visium_HD if technology == "visium_hd" else quantify_diffusion_stereoseq
-    return fn(path, resolution=resolution, mask_kwargs=mask_kwargs, return_data=return_data, max_bins=max_bins)
+    return fn(path, resolution=resolution, mask_kwargs=mask_kwargs, return_data=return_data, max_bins=max_bins,
+              min_component_counts_fraction=min_component_counts_fraction)
 
 
 _PREDICT_FORMULAS = {
